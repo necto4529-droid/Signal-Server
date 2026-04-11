@@ -15,19 +15,20 @@ wss.on('connection', (ws) => {
       console.log(`[${connId}] ← ${data.type}`, data.target ? `для ${data.target}` : '');
 
       if (data.type === 'register') {
-        peerId = data.peerId;
+        peerId = data.peerId.toLowerCase(); // ← ВСЕГДА нижний регистр
         peers.set(peerId, ws);
         ws.send(JSON.stringify({ type: 'registered' }));
         console.log(`[${connId}] Зарегистрирован как ${peerId}`);
       } 
       else if (data.type === 'signal' && data.target) {
-        const targetWs = peers.get(data.target);
+        const targetId = data.target.toLowerCase(); // ← нижний регистр
+        const targetWs = peers.get(targetId);
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
           const payload = { type: 'signal', from: peerId, payload: data.payload };
           targetWs.send(JSON.stringify(payload));
-          console.log(`[${connId}] → сигнал от ${peerId} к ${data.target}`);
+          console.log(`[${connId}] → сигнал от ${peerId} к ${targetId}`);
         } else {
-          console.log(`[${connId}] ❌ Цель ${data.target} не найдена или не открыта`);
+          console.log(`[${connId}] ❌ Цель ${targetId} не найдена или не открыта`);
         }
       }
     } catch (e) {
