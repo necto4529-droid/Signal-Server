@@ -3,184 +3,166 @@ const fs = require('fs');
 const path = require('path');
 
 const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
-const peers = new Map(); // peerId -> ws
 
+// peerId -> WebSocket
+const peers = new Map();
+
+// Offline message queue: { [recipientId]: [{msgId, from, payload, ts, ephemeral}] }
 const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
+let queue = {};
 
-// ── Persistent storage ──────────────────────────────────────────────────────
-// Structure: { [recipientId]: [ {msgId, from, payload, timestamp, ephemeral?}, ... ] }
-let offlineMessages = {};
 try {
   if (fs.existsSync(STORAGE_FILE)) {
-    offlineMessages = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-    console.log('[server] Loaded offline messages from disk');
+    queue = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
+    console.log('[server] Loaded offline queue from disk');
   }
 } catch (e) {
-  console.error('[server] Failed to load offline messages', e);
+  console.error('[server] Failed to load queue', e);
 }
 
-function persistMessages() {
-  try {
-    fs.writeFileSync(STORAGE_FILE, JSON.stringify(offlineMessages));
-  } catch (e) {
-    console.error('[server] Failed to save messages', e);
-  }
+function persist() {
+  try { fs.writeFileSync(STORAGE_FILE, JSON.stringify(queue)); }
+  catch (e) { console.error('[server] persist error', e); }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function sendJSON(ws, obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+function send(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN)
     ws.send(JSON.stringify(obj));
+}
+
+// Broadcast presence change to ALL connected peers
+function broadcastPresence(peerId, isOnline) {
+  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
+  for (const [, ws] of peers) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
   }
 }
 
-function queueForPeer(recipientId, msgObj) {
-  if (!offlineMessages[recipientId]) offlineMessages[recipientId] = [];
-  // Deduplicate by msgId
-  const exists = offlineMessages[recipientId].some(m => m.msgId === msgObj.msgId);
-  if (!exists) {
-    offlineMessages[recipientId].push(msgObj);
-    persistMessages();
-  }
-}
-
-function removeMessage(recipientId, msgId) {
-  if (!offlineMessages[recipientId]) return;
-  const before = offlineMessages[recipientId].length;
-  offlineMessages[recipientId] = offlineMessages[recipientId].filter(m => m.msgId !== msgId);
-  if (offlineMessages[recipientId].length === 0) delete offlineMessages[recipientId];
-  if (offlineMessages[recipientId]?.length !== before || before > 0) {
-    persistMessages();
-  }
-}
-
-function pendingCount(peerId) {
-  // Only count non-ephemeral messages
-  return (offlineMessages[peerId] || []).filter(m => !m.ephemeral).length;
-}
-
-// ── Connection handler ────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
-  let peerId = null;
+  let myId = null;
 
   ws.on('message', (raw) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // ── REGISTER ──────────────────────────────────────────────────────────
+    // ── REGISTER ────────────────────────────────────────────────
     if (data.type === 'register') {
-      peerId = data.peerId.toLowerCase();
-      peers.set(peerId, ws);
-      console.log(`[${peerId}] Registered`);
+      myId = (data.peerId || '').toLowerCase();
+      if (!myId) return;
+      peers.set(myId, ws);
+      console.log(`[${myId}] registered`);
 
-      sendJSON(ws, { type: 'registered' });
+      send(ws, { type: 'registered' });
 
-      // Deliver all queued messages (including ephemeral)
-      const queue = offlineMessages[peerId] || [];
-      if (queue.length > 0) {
-        console.log(`[${peerId}] Delivering ${queue.length} queued messages`);
-        for (const msg of queue) {
-          sendJSON(ws, {
-            type: 'incoming-msg',
-            from: msg.from,
-            msgId: msg.msgId,
-            payload: msg.payload
-          });
+      // Broadcast that this peer is now online
+      broadcastPresence(myId, true);
+
+      // Deliver queued messages
+      const pending = queue[myId] || [];
+      if (pending.length > 0) {
+        console.log(`[${myId}] delivering ${pending.length} queued msgs`);
+        for (const m of pending) {
+          send(ws, { type: 'incoming-msg', from: m.from, msgId: m.msgId, payload: m.payload });
         }
-        // Ephemeral messages (typing etc.) auto-remove on delivery
-        const ephemeralIds = queue.filter(m => m.ephemeral).map(m => m.msgId);
-        for (const id of ephemeralIds) removeMessage(peerId, id);
+        // Auto-remove ephemeral from queue (they won't be acked)
+        queue[myId] = pending.filter(m => !m.ephemeral);
+        if (!queue[myId].length) delete queue[myId];
+        persist();
       }
       return;
     }
 
-    // ── SEND-MSG: sender → server → recipient ──────────────────────────────
+    // ── SEND-MSG ────────────────────────────────────────────────
     if (data.type === 'send-msg') {
-      if (!peerId) return;
+      if (!myId) return;
       const target = (data.target || '').toLowerCase();
-      const msgId = data.msgId;
-      const payload = data.payload;
-      const ephemeral = !!data.ephemeral;
+      const { msgId, payload, ephemeral } = data;
       if (!target || !msgId || !payload) return;
-
-      const msgObj = { msgId, from: peerId, payload, timestamp: Date.now(), ephemeral };
 
       const targetWs = peers.get(target);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        // Recipient is online — deliver immediately
-        sendJSON(targetWs, { type: 'incoming-msg', from: peerId, msgId, payload });
-        console.log(`[${peerId}] → [${target}] delivered immediately`);
-        // For ephemeral, don't queue or wait for ack
-        if (ephemeral) return;
-        // Queue temporarily — recipient must ACK to confirm receipt
-        // (handles race condition where WS drops between send and ack)
-        queueForPeer(target, msgObj);
-      } else {
-        // Recipient offline — queue for later
+        // Online: deliver immediately
+        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
+        console.log(`[${myId}] → [${target}] live delivery`);
+        // For non-ephemeral: also queue temporarily until ACK confirms receipt
         if (!ephemeral) {
-          queueForPeer(target, msgObj);
-          console.log(`[${peerId}] → [${target}] queued (offline)`);
+          if (!queue[target]) queue[target] = [];
+          if (!queue[target].find(m => m.msgId === msgId)) {
+            queue[target].push({ msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
+            persist();
+          }
+        }
+      } else {
+        // Offline: queue
+        if (!ephemeral) {
+          if (!queue[target]) queue[target] = [];
+          if (!queue[target].find(m => m.msgId === msgId)) {
+            queue[target].push({ msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
+            persist();
+            console.log(`[${myId}] → [${target}] queued (offline)`);
+          }
         }
       }
       return;
     }
 
-    // ── ACK-MSG: recipient confirms receipt → delete from queue → notify sender ──
+    // ── ACK-MSG: recipient got the message, delete it ────────────
     if (data.type === 'ack-msg') {
-      if (!peerId) return;
-      const msgId = data.msgId;
+      if (!myId) return;
+      const { msgId } = data;
       if (!msgId) return;
 
-      // Find which sender this message belongs to
-      const queue = offlineMessages[peerId] || [];
-      const msgObj = queue.find(m => m.msgId === msgId);
+      const pending = queue[myId] || [];
+      const msgObj = pending.find(m => m.msgId === msgId);
       const senderId = msgObj?.from;
 
-      removeMessage(peerId, msgId);
-      console.log(`[${peerId}] ACK msgId=${msgId}, sender=${senderId}`);
+      // Remove from queue
+      if (queue[myId]) {
+        queue[myId] = queue[myId].filter(m => m.msgId !== msgId);
+        if (!queue[myId].length) delete queue[myId];
+        persist();
+      }
 
-      // Notify the original sender that message was delivered
+      console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
+
+      // Notify sender of delivery
       if (senderId) {
         const senderWs = peers.get(senderId);
         if (senderWs && senderWs.readyState === WebSocket.OPEN) {
-          sendJSON(senderWs, { type: 'msg-delivered', msgId, by: peerId });
-          console.log(`[${senderId}] ← delivered notification for msgId=${msgId}`);
+          send(senderWs, { type: 'msg-delivered', msgId, by: myId });
         }
       }
       return;
     }
 
-    // ── CHECK-PENDING: sender asks how many messages are queued for a peer ──
-    // Used to determine online/offline status of the peer
-    if (data.type === 'check-pending') {
-      if (!peerId) return;
+    // ── QUERY-PRESENCE: is a specific peer online? ───────────────
+    if (data.type === 'query-presence') {
+      if (!myId) return;
       const target = (data.target || '').toLowerCase();
-      const pending = pendingCount(target);
-      sendJSON(ws, { type: 'pending-status', target, pending });
-      console.log(`[${peerId}] check-pending [${target}] → ${pending}`);
+      const targetWs = peers.get(target);
+      const isOnline = !!(targetWs && targetWs.readyState === WebSocket.OPEN);
+      send(ws, { type: 'presence-reply', target, online: isOnline });
       return;
     }
 
-    // ── Legacy signal relay (kept for compatibility) ──────────────────────
+    // ── Legacy signal relay ──────────────────────────────────────
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
-      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        sendJSON(targetWs, { type: 'signal', from: peerId, payload: data.payload });
-      }
+      if (targetWs && targetWs.readyState === WebSocket.OPEN)
+        send(targetWs, { type: 'signal', from: myId, payload: data.payload });
     }
   });
 
   ws.on('close', () => {
-    if (peerId) {
-      peers.delete(peerId);
-      console.log(`[${peerId}] Disconnected`);
+    if (myId) {
+      peers.delete(myId);
+      console.log(`[${myId}] disconnected`);
+      // Broadcast offline
+      broadcastPresence(myId, false);
     }
   });
 
-  ws.on('error', (e) => {
-    console.error('WS error', e.message);
-  });
+  ws.on('error', e => console.error('ws error', e.message));
 });
 
-const port = process.env.PORT || 3000;
-console.log(`[server] BloodyChat signal server running on port ${port}`);
+console.log(`[server] BloodyChat running on port ${process.env.PORT || 3000}`);
