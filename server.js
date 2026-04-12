@@ -1,51 +1,101 @@
 const WebSocket = require('ws');
-const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
+const fs = require('fs');
+const path = require('path');
 
+const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 const peers = new Map();
-let messageCounter = 0;
+const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
+
+// Загружаем сохранённые сообщения при старте
+let offlineMessages = {};
+try {
+  if (fs.existsSync(STORAGE_FILE)) {
+    offlineMessages = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
+    console.log('Loaded offline messages from disk');
+  }
+} catch (e) {
+  console.error('Failed to load offline messages', e);
+}
+
+function saveMessages() {
+  try {
+    fs.writeFileSync(STORAGE_FILE, JSON.stringify(offlineMessages, null, 2));
+  } catch (e) {
+    console.error('Failed to save offline messages', e);
+  }
+}
 
 wss.on('connection', (ws) => {
   let peerId = null;
-  const connId = ++messageCounter;
-  console.log(`[${connId}] Новое соединение`);
 
   ws.on('message', (raw) => {
     try {
       const data = JSON.parse(raw);
-      console.log(`[${connId}] ← ${data.type}`, data.target ? `для ${data.target}` : '');
-
+      
       if (data.type === 'register') {
-        peerId = data.peerId.toLowerCase(); // ← ВСЕГДА нижний регистр
+        peerId = data.peerId.toLowerCase();
         peers.set(peerId, ws);
         ws.send(JSON.stringify({ type: 'registered' }));
-        console.log(`[${connId}] Зарегистрирован как ${peerId}`);
-      } 
+        console.log(`[${peerId}] Registered`);
+
+        // Отправляем накопленные офлайн-сообщения
+        if (offlineMessages[peerId] && offlineMessages[peerId].length > 0) {
+          ws.send(JSON.stringify({
+            type: 'offline-msgs',
+            messages: offlineMessages[peerId]
+          }));
+          console.log(`[${peerId}] Sent ${offlineMessages[peerId].length} offline messages`);
+          // НЕ удаляем сразу – ждём подтверждения от клиента
+        }
+      }
+      
       else if (data.type === 'signal' && data.target) {
-        const targetId = data.target.toLowerCase(); // ← нижний регистр
-        const targetWs = peers.get(targetId);
+        const targetWs = peers.get(data.target.toLowerCase());
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-          const payload = { type: 'signal', from: peerId, payload: data.payload };
-          targetWs.send(JSON.stringify(payload));
-          console.log(`[${connId}] → сигнал от ${peerId} к ${targetId}`);
-        } else {
-          console.log(`[${connId}] ❌ Цель ${targetId} не найдена или не открыта`);
+          targetWs.send(JSON.stringify({
+            type: 'signal',
+            from: peerId,
+            payload: data.payload
+          }));
+        }
+      }
+      
+      // Сохранить офлайн-сообщение
+      else if (data.type === 'store-offline') {
+        const target = data.target.toLowerCase();
+        if (!offlineMessages[target]) offlineMessages[target] = [];
+        offlineMessages[target].push({
+          from: peerId,
+          payload: data.payload,
+          timestamp: Date.now()
+        });
+        saveMessages();
+        console.log(`[${peerId}] Stored offline message for ${target}`);
+      }
+      
+      // Подтверждение получения – удаляем доставленные сообщения
+      else if (data.type === 'ack-offline') {
+        const count = data.count || 0;
+        if (peerId && offlineMessages[peerId]) {
+          offlineMessages[peerId] = offlineMessages[peerId].slice(count);
+          if (offlineMessages[peerId].length === 0) {
+            delete offlineMessages[peerId];
+          }
+          saveMessages();
+          console.log(`[${peerId}] Acknowledged ${count} offline messages, remaining: ${offlineMessages[peerId]?.length || 0}`);
         }
       }
     } catch (e) {
-      console.error(`[${connId}] Ошибка парсинга:`, e.message);
+      console.error('Invalid message', e);
     }
   });
 
   ws.on('close', () => {
     if (peerId) {
       peers.delete(peerId);
-      console.log(`[${connId}] ${peerId} отключился`);
+      console.log(`[${peerId}] Disconnected`);
     }
-  });
-
-  ws.on('error', (err) => {
-    console.error(`[${connId}] Ошибка WebSocket:`, err.message);
   });
 });
 
-console.log('🚀 Сигнальный сервер запущен на порту', process.env.PORT || 3000);
+console.log('Signal server with offline storage running on port', process.env.PORT || 3000);
