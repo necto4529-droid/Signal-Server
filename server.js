@@ -60,12 +60,19 @@ wss.on('connection', (ws) => {
       // Deliver queued messages
       const pending = queue[myId] || [];
       if (pending.length > 0) {
-        console.log(`[${myId}] delivering ${pending.length} queued msgs`);
+        console.log(`[${myId}] delivering ${pending.length} queued items`);
         for (const m of pending) {
-          send(ws, { type: 'incoming-msg', from: m.from, msgId: m.msgId, payload: m.payload });
+          // Обычные зашифрованные сообщения
+          if (m.payload) {
+            send(ws, { type: 'incoming-msg', from: m.from, msgId: m.msgId, payload: m.payload });
+          }
+          // Событие прослушивания голосового
+          else if (m.type === 'voice-listened') {
+            send(ws, { type: 'voice-listened', from: m.from, voiceMsgId: m.voiceMsgId });
+          }
         }
-        // Auto-remove ephemeral from queue (they won't be acked)
-        queue[myId] = pending.filter(m => !m.ephemeral);
+        // Оставляем в очереди только те сообщения, которые требуют ACK (не ephemeral и не voice-listened)
+        queue[myId] = pending.filter(m => m.payload && !m.ephemeral);
         if (!queue[myId].length) delete queue[myId];
         persist();
       }
@@ -145,19 +152,31 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── VOICE-LISTENED RELAY ─────────────────────────────────────
+    // ── VOICE-LISTENED RELAY (с офлайн-сохранением) ───────────────
     if (data.type === 'voice-listened') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
       const targetWs = peers.get(target);
+
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        // Пересылаем отправителю голосового
+        // Отправитель онлайн – доставляем сразу
         send(targetWs, {
           type: 'voice-listened',
           from: myId,
           voiceMsgId: data.voiceMsgId
         });
-        console.log(`[${myId}] → [${target}] voice-listened relay`);
+        console.log(`[${myId}] → [${target}] voice-listened live`);
+      } else {
+        // Отправитель офлайн – сохраняем в его очередь
+        if (!queue[target]) queue[target] = [];
+        queue[target].push({
+          type: 'voice-listened',
+          from: myId,
+          voiceMsgId: data.voiceMsgId,
+          ts: Date.now()
+        });
+        persist();
+        console.log(`[${myId}] → [${target}] voice-listened queued (offline)`);
       }
       return;
     }
