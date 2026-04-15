@@ -145,6 +145,23 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── VOICE-LISTENED RELAY ─────────────────────────────────────
+    if (data.type === 'voice-listened') {
+      if (!myId) return;
+      const target = (data.target || '').toLowerCase();
+      const targetWs = peers.get(target);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        // Пересылаем отправителю голосового
+        send(targetWs, {
+          type: 'voice-listened',
+          from: myId,
+          voiceMsgId: data.voiceMsgId
+        });
+        console.log(`[${myId}] → [${target}] voice-listened relay`);
+      }
+      return;
+    }
+
     // ── Legacy signal relay ──────────────────────────────────────
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
