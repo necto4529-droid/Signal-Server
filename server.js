@@ -3,72 +3,58 @@ const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 
-// --- НАСТРОЙКИ SUPABASE (ТВОИ КЛЮЧИ) ---
+// --- Твои ключи Supabase ---
 const SUPABASE_URL = 'https://lnrrnhpzudcsyjijbjrh.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_Q-1rp2b2aWmw5TpNC7Lw7Q_luaAVrUY';
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// --- НАСТРОЙКИ БЭКАПА ---
-const BACKUP_BUCKET = 'backups';          // имя бакета, который ты создал в Supabase Storage
-const BACKUP_FILE_NAME = 'offline_messages.json';
-
 const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 const peers = new Map();
 
-// Локальный файл с офлайн-очередью
 const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
 let queue = {};
 
-// --- ФУНКЦИИ ДЛЯ РАБОТЫ С БЭКАПОМ В SUPABASE ---
-
-// Скачать бэкап из Supabase (если локальный файл отсутствует)
+// --- ФУНКЦИИ БЭКАПА В ТАБЛИЦУ SUPABASE ---
 async function downloadBackup() {
   try {
     const { data, error } = await supabase
-      .storage
-      .from(BACKUP_BUCKET)
-      .download(BACKUP_FILE_NAME);
+      .from('backups')
+      .select('data')
+      .eq('id', 1)
+      .maybeSingle();
 
     if (error || !data) {
       console.log('[backup] Бэкап в Supabase не найден, начинаем с пустой очереди.');
       return null;
     }
-
-    const text = await data.text();
-    const parsed = JSON.parse(text);
-    console.log('[backup] Очередь загружена из Supabase.');
-    return parsed;
+    console.log('[backup] Очередь загружена из таблицы Supabase.');
+    return data.data;
   } catch (e) {
     console.error('[backup] Ошибка загрузки из Supabase:', e.message);
     return null;
   }
 }
 
-// Загрузить текущую очередь в Supabase (перезаписывая старый файл)
 async function uploadBackup(queueData) {
   try {
-    const blob = new Blob([JSON.stringify(queueData)], { type: 'application/json' });
     const { error } = await supabase
-      .storage
-      .from(BACKUP_BUCKET)
-      .upload(BACKUP_FILE_NAME, blob, { upsert: true });   // upsert: true -> перезаписывает файл, если он уже есть
+      .from('backups')
+      .upsert({ id: 1, data: queueData, updated_at: new Date() });
 
     if (error) throw error;
-    console.log('[backup] Очередь загружена в Supabase.');
+    console.log('[backup] Очередь загружена в таблицу Supabase.');
   } catch (e) {
     console.error('[backup] Ошибка загрузки в Supabase:', e.message);
   }
 }
 
-// --- ИНИЦИАЛИЗАЦИЯ ОЧЕРЕДИ ПРИ ЗАПУСКЕ СЕРВЕРА ---
+// --- ИНИЦИАЛИЗАЦИЯ ОЧЕРЕДИ ---
 async function initQueue() {
   try {
     if (fs.existsSync(STORAGE_FILE)) {
-      // Локальный файл есть — загружаем из него
       queue = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
       console.log('[server] Очередь загружена с локального диска.');
     } else {
-      // Локального файла нет — пробуем скачать из Supabase
       const backup = await downloadBackup();
       if (backup) {
         queue = backup;
@@ -85,19 +71,15 @@ async function initQueue() {
   }
 }
 
-// Сохранить очередь локально И отправить бэкап в Supabase
 function persist() {
   try {
-    // Сохраняем локально
     fs.writeFileSync(STORAGE_FILE, JSON.stringify(queue));
-    // Отправляем в Supabase (асинхронно, чтобы не тормозить сервер)
     uploadBackup(queue).catch(e => console.error('[backup] Ошибка асинхронной загрузки:', e));
   } catch (e) {
     console.error('[server] Ошибка сохранения очереди:', e);
   }
 }
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ WEBSOCKET ---
 function send(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
@@ -111,7 +93,6 @@ function broadcastPresence(peerId, isOnline) {
   }
 }
 
-// --- ОСНОВНАЯ ЛОГИКА WEBSOCKET (ТВОЙ СТАРЫЙ ПРОВЕРЕННЫЙ КОД) ---
 wss.on('connection', (ws) => {
   let myId = null;
 
@@ -129,7 +110,6 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
 
-      // Доставка накопленных офлайн-сообщений
       const pending = queue[myId] || [];
       if (pending.length > 0) {
         console.log(`[${myId}] delivering ${pending.length} queued items`);
@@ -140,7 +120,6 @@ wss.on('connection', (ws) => {
             send(ws, { type: 'voice-listened', from: m.from, voiceMsgId: m.voiceMsgId });
           }
         }
-        // Удаляем доставленные сообщения из очереди
         queue[myId] = pending.filter(m => m.payload && !m.ephemeral);
         if (!queue[myId].length) delete queue[myId];
         persist();
@@ -157,7 +136,6 @@ wss.on('connection', (ws) => {
 
       const targetWs = peers.get(target);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        // Получатель онлайн – доставляем сразу
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
         console.log(`[${myId}] → [${target}] live delivery`);
         if (!ephemeral) {
@@ -168,7 +146,6 @@ wss.on('connection', (ws) => {
           }
         }
       } else {
-        // Получатель офлайн – сохраняем в очередь
         if (!ephemeral) {
           if (!queue[target]) queue[target] = [];
           if (!queue[target].find(m => m.msgId === msgId)) {
