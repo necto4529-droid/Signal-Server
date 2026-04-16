@@ -127,12 +127,15 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── SEND-MSG ────────────────────────────────────────────────
+    // ── SEND-MSG (с подтверждением msg-queued) ─────────────────
     if (data.type === 'send-msg') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
       const { msgId, payload, ephemeral } = data;
       if (!target || !msgId || !payload) return;
+
+      // Сразу подтверждаем отправителю, что сообщение принято сервером
+      send(ws, { type: 'msg-queued', msgId });
 
       const targetWs = peers.get(target);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
