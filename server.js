@@ -1,204 +1,187 @@
 const WebSocket = require('ws');
-const fs = require('fs');
-const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
-const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
+// --- Твои ключи Supabase (уже проверенные) ---
+const SUPABASE_URL = 'https://lnrrnhpzudcsyjijbjrh.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_Q-1rp2b2aWmw5TpNC7Lw7Q_luaAVrUY';
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// peerId -> WebSocket
-const peers = new Map();
-
-// Offline message queue: { [recipientId]: [{msgId, from, payload, ts, ephemeral}] }
-const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
-let queue = {};
-
-try {
-  if (fs.existsSync(STORAGE_FILE)) {
-    queue = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-    console.log('[server] Loaded offline queue from disk');
-  }
-} catch (e) {
-  console.error('[server] Failed to load queue', e);
-}
-
-function persist() {
-  try { fs.writeFileSync(STORAGE_FILE, JSON.stringify(queue)); }
-  catch (e) { console.error('[server] persist error', e); }
-}
+const wss = new WebSocket.Server({ port: process.env.PORT || 8080 });
+const clients = new Map(); // peerId -> WebSocket
 
 function send(ws, obj) {
-  if (ws && ws.readyState === WebSocket.OPEN)
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(obj));
+  }
 }
 
-// Broadcast presence change to ALL connected peers
 function broadcastPresence(peerId, isOnline) {
   const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
-  for (const [, ws] of peers) {
+  for (const [, ws] of clients) {
     if (ws.readyState === WebSocket.OPEN) ws.send(msg);
   }
 }
 
 wss.on('connection', (ws) => {
-  let myId = null;
+  let userId = null;
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // ── REGISTER ────────────────────────────────────────────────
+    // --- REGISTER ---
     if (data.type === 'register') {
-      myId = (data.peerId || '').toLowerCase();
-      if (!myId) return;
-      peers.set(myId, ws);
-      console.log(`[${myId}] registered`);
+      userId = (data.peerId || '').toLowerCase();
+      if (!userId) return;
+      clients.set(userId, ws);
+      ws.userId = userId;
+      console.log(`[${userId}] registered`);
 
       send(ws, { type: 'registered' });
+      broadcastPresence(userId, true);
 
-      // Broadcast that this peer is now online
-      broadcastPresence(myId, true);
+      // Доставляем офлайн-сообщения из Supabase
+      const now = Date.now();
+      const { data: pending, error } = await supabase
+        .from('offline_queue')
+        .select('*')
+        .eq('recipient_id', userId)
+        .or(`expires_at.is.null,expires_at.gt.${now}`)
+        .order('timestamp', { ascending: true });
 
-      // Deliver queued messages
-      const pending = queue[myId] || [];
-      if (pending.length > 0) {
-        console.log(`[${myId}] delivering ${pending.length} queued items`);
-        for (const m of pending) {
-          // Обычные зашифрованные сообщения
-          if (m.payload) {
-            send(ws, { type: 'incoming-msg', from: m.from, msgId: m.msgId, payload: m.payload });
-          }
-          // Событие прослушивания голосового
-          else if (m.type === 'voice-listened') {
-            send(ws, { type: 'voice-listened', from: m.from, voiceMsgId: m.voiceMsgId });
+      if (!error && pending && pending.length > 0) {
+        console.log(`[${userId}] delivering ${pending.length} queued items`);
+        const idsToDelete = pending.map(item => item.msg_id);
+        await supabase.from('offline_queue').delete().in('msg_id', idsToDelete);
+
+        for (const item of pending) {
+          if (item.type === 'msg') {
+            send(ws, {
+              type: 'incoming-msg',
+              from: item.sender_id,
+              msgId: item.msg_id,
+              payload: item.payload
+            });
+          } else if (item.type === 'voice-listened') {
+            send(ws, {
+              type: 'voice-listened',
+              from: item.sender_id,
+              voiceMsgId: item.payload.voiceMsgId
+            });
           }
         }
-        // Оставляем в очереди только те сообщения, которые требуют ACK (не ephemeral и не voice-listened)
-        queue[myId] = pending.filter(m => m.payload && !m.ephemeral);
-        if (!queue[myId].length) delete queue[myId];
-        persist();
       }
       return;
     }
 
-    // ── SEND-MSG ────────────────────────────────────────────────
+    // --- SEND-MSG ---
     if (data.type === 'send-msg') {
-      if (!myId) return;
+      if (!userId) return;
       const target = (data.target || '').toLowerCase();
       const { msgId, payload, ephemeral } = data;
       if (!target || !msgId || !payload) return;
 
-      const targetWs = peers.get(target);
+      const targetWs = clients.get(target);
+
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        // Online: deliver immediately
-        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        console.log(`[${myId}] → [${target}] live delivery`);
-        // For non-ephemeral: also queue temporarily until ACK confirms receipt
+        send(targetWs, { type: 'incoming-msg', from: userId, msgId, payload });
+        console.log(`[${userId}] → [${target}] live delivery`);
         if (!ephemeral) {
-          if (!queue[target]) queue[target] = [];
-          if (!queue[target].find(m => m.msgId === msgId)) {
-            queue[target].push({ msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
-            persist();
-          }
+          const timestamp = Date.now();
+          const expires = timestamp + (14 * 24 * 60 * 60 * 1000);
+          await supabase.from('offline_queue').upsert({
+            msg_id: msgId,
+            recipient_id: target,
+            sender_id: userId,
+            payload: payload,
+            type: 'msg',
+            timestamp: timestamp,
+            expires_at: expires
+          });
         }
       } else {
-        // Offline: queue
         if (!ephemeral) {
-          if (!queue[target]) queue[target] = [];
-          if (!queue[target].find(m => m.msgId === msgId)) {
-            queue[target].push({ msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
-            persist();
-            console.log(`[${myId}] → [${target}] queued (offline)`);
-          }
+          const timestamp = Date.now();
+          const expires = timestamp + (14 * 24 * 60 * 60 * 1000);
+          await supabase.from('offline_queue').insert({
+            msg_id: msgId,
+            recipient_id: target,
+            sender_id: userId,
+            payload: payload,
+            type: 'msg',
+            timestamp: timestamp,
+            expires_at: expires
+          });
+          console.log(`[${userId}] → [${target}] queued in Supabase`);
         }
       }
       return;
     }
 
-    // ── ACK-MSG: recipient got the message, delete it ────────────
+    // --- ACK-MSG ---
     if (data.type === 'ack-msg') {
-      if (!myId) return;
+      if (!userId) return;
       const { msgId } = data;
       if (!msgId) return;
-
-      const pending = queue[myId] || [];
-      const msgObj = pending.find(m => m.msgId === msgId);
-      const senderId = msgObj?.from;
-
-      // Remove from queue
-      if (queue[myId]) {
-        queue[myId] = queue[myId].filter(m => m.msgId !== msgId);
-        if (!queue[myId].length) delete queue[myId];
-        persist();
-      }
-
-      console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
-
-      // Notify sender of delivery
-      if (senderId) {
-        const senderWs = peers.get(senderId);
-        if (senderWs && senderWs.readyState === WebSocket.OPEN) {
-          send(senderWs, { type: 'msg-delivered', msgId, by: myId });
-        }
-      }
+      await supabase.from('offline_queue').delete().eq('msg_id', msgId);
+      console.log(`[${userId}] ACK ${msgId}`);
       return;
     }
 
-    // ── QUERY-PRESENCE: is a specific peer online? ───────────────
+    // --- QUERY-PRESENCE ---
     if (data.type === 'query-presence') {
-      if (!myId) return;
+      if (!userId) return;
       const target = (data.target || '').toLowerCase();
-      const targetWs = peers.get(target);
-      const isOnline = !!(targetWs && targetWs.readyState === WebSocket.OPEN);
+      const isOnline = clients.has(target);
       send(ws, { type: 'presence-reply', target, online: isOnline });
       return;
     }
 
-    // ── VOICE-LISTENED RELAY (с офлайн-сохранением) ───────────────
+    // --- VOICE-LISTENED ---
     if (data.type === 'voice-listened') {
-      if (!myId) return;
+      if (!userId) return;
       const target = (data.target || '').toLowerCase();
-      const targetWs = peers.get(target);
+      const targetWs = clients.get(target);
+      const payload = { voiceMsgId: data.voiceMsgId };
 
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        // Отправитель онлайн – доставляем сразу
-        send(targetWs, {
-          type: 'voice-listened',
-          from: myId,
-          voiceMsgId: data.voiceMsgId
-        });
-        console.log(`[${myId}] → [${target}] voice-listened live`);
+        send(targetWs, { type: 'voice-listened', from: userId, voiceMsgId: data.voiceMsgId });
+        console.log(`[${userId}] → [${target}] voice-listened live`);
       } else {
-        // Отправитель офлайн – сохраняем в его очередь
-        if (!queue[target]) queue[target] = [];
-        queue[target].push({
+        const timestamp = Date.now();
+        const expires = timestamp + (14 * 24 * 60 * 60 * 1000);
+        await supabase.from('offline_queue').insert({
+          msg_id: `vl-${timestamp}-${userId}-${target}`,
+          recipient_id: target,
+          sender_id: userId,
+          payload: payload,
           type: 'voice-listened',
-          from: myId,
-          voiceMsgId: data.voiceMsgId,
-          ts: Date.now()
+          timestamp: timestamp,
+          expires_at: expires
         });
-        persist();
-        console.log(`[${myId}] → [${target}] voice-listened queued (offline)`);
+        console.log(`[${userId}] → [${target}] voice-listened queued`);
       }
       return;
     }
 
-    // ── Legacy signal relay ──────────────────────────────────────
+    // --- Legacy signal ---
     if (data.type === 'signal' && data.target) {
-      const targetWs = peers.get(data.target.toLowerCase());
-      if (targetWs && targetWs.readyState === WebSocket.OPEN)
-        send(targetWs, { type: 'signal', from: myId, payload: data.payload });
+      const targetWs = clients.get(data.target.toLowerCase());
+      if (targetWs) {
+        send(targetWs, { type: 'signal', from: userId, payload: data.payload });
+      }
     }
   });
 
   ws.on('close', () => {
-    if (myId) {
-      peers.delete(myId);
-      console.log(`[${myId}] disconnected`);
-      // Broadcast offline
-      broadcastPresence(myId, false);
+    if (userId) {
+      clients.delete(userId);
+      console.log(`[${userId}] disconnected`);
+      broadcastPresence(userId, false);
     }
   });
 
   ws.on('error', e => console.error('ws error', e.message));
 });
 
-console.log(`[server] BloodyChat running on port ${process.env.PORT || 3000}`);
+console.log(`🚀 Server running on port ${wss.options.port}`);
