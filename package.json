@@ -1,15 +1,7 @@
 {
-  "name": "signal-server",
+  "name": "bloodychat-signal",
   "version": "1.0.0",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.49.1",
-    "ws": "^8.18.1"
-  },
-  "engines": {
-    "node": ">=20.0.0"
-  }
+  "engines": { "node": ">=18.0.0" },
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "ws": "^8.13.0" }
 }
