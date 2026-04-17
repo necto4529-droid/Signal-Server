@@ -1,42 +1,25 @@
 const WebSocket = require('ws');
-const fs = require('fs');
+const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('fs');
 
-const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
-const peers = new Map();
+// --- База данных SQLite ---
+const dbPath = path.join(__dirname, 'offline_queue.db');
+const db = new Database(dbPath);
 
-const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
-let queue = {};
+// Создаём таблицу для офлайн-очереди
+db.exec(`
+  CREATE TABLE IF NOT EXISTS offline_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    recipient_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    timestamp INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_recipient ON offline_queue (recipient_id);
+`);
 
-try {
-  if (fs.existsSync(STORAGE_FILE)) {
-    queue = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
-    console.log('[server] Loaded offline queue from disk');
-  }
-} catch (e) {
-  console.error('[server] Failed to load queue', e);
-}
-
-function persist() {
-  try { fs.writeFileSync(STORAGE_FILE, JSON.stringify(queue)); }
-  catch (e) { console.error('[server] persist error', e); }
-}
-
-function send(ws, obj) {
-  if (ws && ws.readyState === WebSocket.OPEN)
-    ws.send(JSON.stringify(obj));
-}
-
-function broadcastPresence(peerId, isOnline) {
-  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
-  for (const [, ws] of peers) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
-  }
-}
-
-// --- Настройки OneSignal (оставь свои ключи) ---
-const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
-const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
+// --- Push-подписки (файл) ---
 const pushSubscriptionsFile = path.join(__dirname, 'push_subscriptions.json');
 let pushSubscriptions = {};
 try {
@@ -44,6 +27,10 @@ try {
     pushSubscriptions = JSON.parse(fs.readFileSync(pushSubscriptionsFile, 'utf8'));
   }
 } catch (e) {}
+
+// --- OneSignal ---
+const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
+const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
 
 async function sendPushNotification(userId, message) {
   const playerId = pushSubscriptions[userId];
@@ -62,10 +49,43 @@ async function sendPushNotification(userId, message) {
         headings: { "en": "K-Chat" }
       })
     });
-    console.log(`[push] Уведомление отправлено для ${userId}`);
-  } catch (e) {
-    console.error('[push] Ошибка отправки:', e.message);
+    console.log(`[push] Уведомление для ${userId}`);
+  } catch (e) {}
+}
+
+// --- WebSocket ---
+const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
+const peers = new Map();
+
+function send(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function broadcastPresence(peerId, isOnline) {
+  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
+  for (const [, ws] of peers) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
   }
+}
+
+// Добавление события в очередь
+function enqueue(recipientId, type, payload) {
+  const stmt = db.prepare(`
+    INSERT INTO offline_queue (recipient_id, type, payload, timestamp)
+    VALUES (?, ?, ?, ?)
+  `);
+  stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
+}
+
+// Извлечение и удаление всех событий для пользователя
+function dequeueAll(recipientId) {
+  const stmt = db.prepare(`SELECT * FROM offline_queue WHERE recipient_id = ? ORDER BY timestamp`);
+  const rows = stmt.all(recipientId);
+  if (rows.length > 0) {
+    const deleteStmt = db.prepare(`DELETE FROM offline_queue WHERE recipient_id = ?`);
+    deleteStmt.run(recipientId);
+  }
+  return rows.map(r => ({ type: r.type, payload: JSON.parse(r.payload) }));
 }
 
 wss.on('connection', (ws) => {
@@ -85,21 +105,12 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
 
-      const pending = queue[myId] || [];
-      if (pending.length > 0) {
-        console.log(`[${myId}] delivering ${pending.length} queued items`);
-        for (const m of pending) {
-          if (m.type === 'incoming-msg') {
-            send(ws, { type: 'incoming-msg', from: m.from, msgId: m.msgId, payload: m.payload });
-          } else if (m.type === 'voice-listened') {
-            send(ws, { type: 'voice-listened', from: m.from, voiceMsgId: m.voiceMsgId });
-          } else if (m.type === 'msg-delivered') {
-            send(ws, { type: 'msg-delivered', msgId: m.msgId, by: m.by });
-          }
+      const events = dequeueAll(myId);
+      if (events.length > 0) {
+        console.log(`[${myId}] delivering ${events.length} queued events`);
+        for (const ev of events) {
+          send(ws, { type: ev.type, ...ev.payload });
         }
-        // Удаляем все доставленные события из очереди
-        delete queue[myId];
-        persist();
       }
       return;
     }
@@ -111,7 +122,7 @@ wss.on('connection', (ws) => {
       if (!playerId) return;
       pushSubscriptions[myId] = playerId;
       fs.writeFileSync(pushSubscriptionsFile, JSON.stringify(pushSubscriptions));
-      console.log(`[push] Подписка сохранена для ${myId}`);
+      console.log(`[push] ${myId} subscribed`);
       return;
     }
 
@@ -125,56 +136,45 @@ wss.on('connection', (ws) => {
       const targetWs = peers.get(target);
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        console.log(`[${myId}] → [${target}] live delivery`);
+        console.log(`[${myId}] → [${target}] live`);
         if (!ephemeral) {
-          if (!queue[target]) queue[target] = [];
-          if (!queue[target].find(m => m.msgId === msgId)) {
-            queue[target].push({ type: 'incoming-msg', msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
-            persist();
-          }
+          enqueue(target, 'incoming-msg', { from: myId, msgId, payload });
         }
       } else {
         if (!ephemeral) {
-          if (!queue[target]) queue[target] = [];
-          if (!queue[target].find(m => m.msgId === msgId)) {
-            queue[target].push({ type: 'incoming-msg', msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
-            persist();
-            console.log(`[${myId}] → [${target}] queued (offline)`);
-          }
+          enqueue(target, 'incoming-msg', { from: myId, msgId, payload });
+          console.log(`[${myId}] → [${target}] queued`);
         }
-        sendPushNotification(target, 'У вас новое сообщение').catch(console.warn);
+        sendPushNotification(target, 'Новое сообщение').catch(console.warn);
       }
       return;
     }
 
-    // --- ACK-MSG (теперь сохраняет msg-delivered, если отправитель офлайн) ---
+    // --- ACK-MSG ---
     if (data.type === 'ack-msg') {
       if (!myId) return;
       const { msgId } = data;
       if (!msgId) return;
 
-      const pending = queue[myId] || [];
-      const msgObj = pending.find(m => m.msgId === msgId);
-      const senderId = msgObj?.from;
-
-      if (queue[myId]) {
-        queue[myId] = queue[myId].filter(m => m.msgId !== msgId);
-        if (!queue[myId].length) delete queue[myId];
-        persist();
-      }
-
-      console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
-
-      if (senderId) {
-        const senderWs = peers.get(senderId);
-        if (senderWs && senderWs.readyState === WebSocket.OPEN) {
-          send(senderWs, { type: 'msg-delivered', msgId, by: myId });
-        } else {
-          // Отправитель офлайн – сохраняем уведомление о доставке в его очередь
-          if (!queue[senderId]) queue[senderId] = [];
-          queue[senderId].push({ type: 'msg-delivered', msgId, by: myId, ts: Date.now() });
-          persist();
-          console.log(`[${myId}] msg-delivered queued for offline sender ${senderId}`);
+      // Удаляем сообщение из очереди получателя (помечаем как доставленное)
+      const deleteStmt = db.prepare(`DELETE FROM offline_queue WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ?`);
+      const info = deleteStmt.run(myId, msgId);
+      
+      if (info.changes > 0) {
+        // Находим отправителя этого сообщения
+        const row = db.prepare(`SELECT json_extract(payload, '$.from') as sender FROM offline_queue WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ?`).get(myId, msgId);
+        const senderId = row?.sender;
+        
+        console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
+        
+        if (senderId) {
+          const senderWs = peers.get(senderId);
+          if (senderWs && senderWs.readyState === WebSocket.OPEN) {
+            send(senderWs, { type: 'msg-delivered', msgId, by: myId });
+          } else {
+            enqueue(senderId, 'msg-delivered', { msgId, by: myId });
+            console.log(`[${myId}] msg-delivered queued for ${senderId}`);
+          }
         }
       }
       return;
@@ -189,7 +189,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // --- VOICE-LISTENED (сохраняет в очередь отправителя, если он офлайн) ---
+    // --- VOICE-LISTENED ---
     if (data.type === 'voice-listened') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -199,15 +199,8 @@ wss.on('connection', (ws) => {
         send(targetWs, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId });
         console.log(`[${myId}] → [${target}] voice-listened live`);
       } else {
-        if (!queue[target]) queue[target] = [];
-        queue[target].push({
-          type: 'voice-listened',
-          from: myId,
-          voiceMsgId: data.voiceMsgId,
-          ts: Date.now()
-        });
-        persist();
-        console.log(`[${myId}] → [${target}] voice-listened queued (offline sender)`);
+        enqueue(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
+        console.log(`[${myId}] → [${target}] voice-listened queued`);
       }
       return;
     }
@@ -215,8 +208,7 @@ wss.on('connection', (ws) => {
     // --- Legacy signal ---
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
-      if (targetWs && targetWs.readyState === WebSocket.OPEN)
-        send(targetWs, { type: 'signal', from: myId, payload: data.payload });
+      if (targetWs) send(targetWs, { type: 'signal', from: myId, payload: data.payload });
     }
   });
 
@@ -227,8 +219,6 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, false);
     }
   });
-
-  ws.on('error', e => console.error('ws error', e.message));
 });
 
-console.log(`[server] BloodyChat + OneSignal running on port ${process.env.PORT || 3000}`);
+console.log(`[server] BloodyChat SQLite running on ${process.env.PORT || 3000}`);
