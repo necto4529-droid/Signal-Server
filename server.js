@@ -1,25 +1,51 @@
 const WebSocket = require('ws');
-const Database = require('better-sqlite3');
-const path = require('path');
 const fs = require('fs');
+const path = require('path');
 
-// --- База данных SQLite ---
-const dbPath = path.join(__dirname, 'offline_queue.db');
-const db = new Database(dbPath);
+const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
+const peers = new Map();
 
-// Создаём таблицу для офлайн-очереди
-db.exec(`
-  CREATE TABLE IF NOT EXISTS offline_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipient_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    timestamp INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_recipient ON offline_queue (recipient_id);
-`);
+const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
+const TMP_FILE = STORAGE_FILE + '.tmp';
 
-// --- Push-подписки (файл) ---
+// Атомарная запись JSON
+function atomicWrite(filePath, data) {
+  try {
+    fs.writeFileSync(TMP_FILE, JSON.stringify(data));
+    fs.renameSync(TMP_FILE, filePath);
+  } catch (e) {
+    console.error('[server] atomicWrite error', e);
+  }
+}
+
+// Загрузка очереди
+let queue = {};
+try {
+  if (fs.existsSync(STORAGE_FILE)) {
+    queue = JSON.parse(fs.readFileSync(STORAGE_FILE, 'utf8'));
+    console.log('[server] Loaded offline queue from disk');
+  }
+} catch (e) {
+  console.error('[server] Failed to load queue', e);
+}
+
+function persist() {
+  atomicWrite(STORAGE_FILE, queue);
+}
+
+function send(ws, obj) {
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify(obj));
+}
+
+function broadcastPresence(peerId, isOnline) {
+  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
+  for (const [, ws] of peers) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  }
+}
+
+// --- Push-подписки (без изменений) ---
 const pushSubscriptionsFile = path.join(__dirname, 'push_subscriptions.json');
 let pushSubscriptions = {};
 try {
@@ -28,7 +54,6 @@ try {
   }
 } catch (e) {}
 
-// --- OneSignal ---
 const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
 const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
 
@@ -53,39 +78,46 @@ async function sendPushNotification(userId, message) {
   } catch (e) {}
 }
 
-// --- WebSocket ---
-const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
-const peers = new Map();
-
-function send(ws, obj) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+// Вспомогательные функции для работы с очередью
+function generateEventId() {
+  return 'evt_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 }
 
-function broadcastPresence(peerId, isOnline) {
-  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
-  for (const [, ws] of peers) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+function enqueueEvent(recipientId, type, payload) {
+  if (!queue[recipientId]) queue[recipientId] = [];
+  const eventId = generateEventId();
+  queue[recipientId].push({
+    id: eventId,
+    type: type,
+    payload: payload,
+    ts: Date.now()
+  });
+  persist();
+  return eventId;
+}
+
+function removeEvent(recipientId, eventId) {
+  if (!queue[recipientId]) return false;
+  const before = queue[recipientId].length;
+  queue[recipientId] = queue[recipientId].filter(e => e.id !== eventId);
+  if (queue[recipientId].length === 0) delete queue[recipientId];
+  if (before !== queue[recipientId]?.length || 0) {
+    persist();
+    return true;
   }
+  return false;
 }
 
-// Добавление события в очередь
-function enqueue(recipientId, type, payload) {
-  const stmt = db.prepare(`
-    INSERT INTO offline_queue (recipient_id, type, payload, timestamp)
-    VALUES (?, ?, ?, ?)
-  `);
-  stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
-}
-
-// Извлечение и удаление всех событий для пользователя
-function dequeueAll(recipientId) {
-  const stmt = db.prepare(`SELECT * FROM offline_queue WHERE recipient_id = ? ORDER BY timestamp`);
-  const rows = stmt.all(recipientId);
-  if (rows.length > 0) {
-    const deleteStmt = db.prepare(`DELETE FROM offline_queue WHERE recipient_id = ?`);
-    deleteStmt.run(recipientId);
+function getAndClearEvents(recipientId, confirmedEventIds) {
+  if (!queue[recipientId]) return [];
+  const events = queue[recipientId];
+  // Удаляем только те события, которые клиент подтвердил
+  if (confirmedEventIds && confirmedEventIds.length > 0) {
+    queue[recipientId] = events.filter(e => !confirmedEventIds.includes(e.id));
+    if (queue[recipientId].length === 0) delete queue[recipientId];
+    persist();
   }
-  return rows.map(r => ({ type: r.type, payload: JSON.parse(r.payload) }));
+  return events;
 }
 
 wss.on('connection', (ws) => {
@@ -105,11 +137,12 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
 
-      const events = dequeueAll(myId);
-      if (events.length > 0) {
-        console.log(`[${myId}] delivering ${events.length} queued events`);
-        for (const ev of events) {
-          send(ws, { type: ev.type, ...ev.payload });
+      // Отправляем все события, но НЕ удаляем их (удаление только по подтверждению)
+      const pending = queue[myId] || [];
+      if (pending.length > 0) {
+        console.log(`[${myId}] delivering ${pending.length} queued events`);
+        for (const ev of pending) {
+          send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
         }
       }
       return;
@@ -138,11 +171,11 @@ wss.on('connection', (ws) => {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
         console.log(`[${myId}] → [${target}] live`);
         if (!ephemeral) {
-          enqueue(target, 'incoming-msg', { from: myId, msgId, payload });
+          enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
       } else {
         if (!ephemeral) {
-          enqueue(target, 'incoming-msg', { from: myId, msgId, payload });
+          enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
           console.log(`[${myId}] → [${target}] queued`);
         }
         sendPushNotification(target, 'Новое сообщение').catch(console.warn);
@@ -150,33 +183,41 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // --- ACK-MSG ---
+    // --- ACK-MSG (подтверждение получения сообщения) ---
     if (data.type === 'ack-msg') {
       if (!myId) return;
       const { msgId } = data;
       if (!msgId) return;
 
-      // Удаляем сообщение из очереди получателя (помечаем как доставленное)
-      const deleteStmt = db.prepare(`DELETE FROM offline_queue WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ?`);
-      const info = deleteStmt.run(myId, msgId);
-      
-      if (info.changes > 0) {
-        // Находим отправителя этого сообщения
-        const row = db.prepare(`SELECT json_extract(payload, '$.from') as sender FROM offline_queue WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ?`).get(myId, msgId);
-        const senderId = row?.sender;
-        
-        console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
-        
+      // Найти событие incoming-msg с таким msgId
+      const events = queue[myId] || [];
+      const ev = events.find(e => e.type === 'incoming-msg' && e.payload.msgId === msgId);
+      if (ev) {
+        removeEvent(myId, ev.id);
+        console.log(`[${myId}] ACK ${msgId}, removed from queue`);
+
+        // Уведомить отправителя о доставке
+        const senderId = ev.payload.from;
         if (senderId) {
           const senderWs = peers.get(senderId);
+          const deliveryEventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
           if (senderWs && senderWs.readyState === WebSocket.OPEN) {
-            send(senderWs, { type: 'msg-delivered', msgId, by: myId });
-          } else {
-            enqueue(senderId, 'msg-delivered', { msgId, by: myId });
-            console.log(`[${myId}] msg-delivered queued for ${senderId}`);
+            send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId: deliveryEventId });
+            // Если отправитель онлайн, можно сразу удалить событие из его очереди (после подтверждения от него)
+            // Пока оставим – клиент отправит подтверждение
           }
         }
       }
+      return;
+    }
+
+    // --- ACK-EVENT (подтверждение получения любого события) ---
+    if (data.type === 'ack-event') {
+      if (!myId) return;
+      const { eventId } = data;
+      if (!eventId) return;
+      removeEvent(myId, eventId);
+      console.log(`[${myId}] ACK event ${eventId}`);
       return;
     }
 
@@ -195,11 +236,11 @@ wss.on('connection', (ws) => {
       const target = (data.target || '').toLowerCase();
       const targetWs = peers.get(target);
 
+      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
       if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-        send(targetWs, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId });
+        send(targetWs, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
         console.log(`[${myId}] → [${target}] voice-listened live`);
       } else {
-        enqueue(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
         console.log(`[${myId}] → [${target}] voice-listened queued`);
       }
       return;
@@ -221,4 +262,4 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`[server] BloodyChat SQLite running on ${process.env.PORT || 3000}`);
+console.log(`[server] Atomic queue + event ACKs running on ${process.env.PORT || 3000}`);
