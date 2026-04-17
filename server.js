@@ -55,7 +55,7 @@ function broadcastPresence(peerId, isOnline) {
 
 // --- Настройки OneSignal ---
 const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
-const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
+const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdx3m4534ns6ju3kudjv33pr4d26pdc2q54mewvbiihqhnhkdsiqacc4immi4ec7ymjn2t4mrakaf6juq';
 
 async function sendPushNotification(userId, message) {
   const playerId = pushSubscriptions[userId];
