@@ -42,10 +42,23 @@ async function sendPushNotification(userId, message) {
 const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 const peers = new Map();
 
+// Heartbeat
+const HEARTBEAT_TIMEOUT = 60000; // 60 секунд
+const heartbeats = new Map();
+
 function send(ws, obj) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
 function broadcastPresence(peerId, isOnline) {
   const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
   for (const [, ws] of peers) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+}
+
+function resetHeartbeat(peerId) {
+  if (heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
+  const timeout = setTimeout(() => {
+    console.log(`[${peerId}] heartbeat timeout, forcing offline`);
+    if (peers.has(peerId)) peers.get(peerId).close();
+  }, HEARTBEAT_TIMEOUT);
+  heartbeats.set(peerId, timeout);
 }
 
 // Добавление события (синхронно)
@@ -91,11 +104,17 @@ wss.on('connection', (ws) => {
       console.log(`[${myId}] registered`);
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
+      resetHeartbeat(myId);
 
-      // Отправляем все события (НЕ удаляя)
       const events = getEvents(myId);
       if (events.length) console.log(`[${myId}] delivering ${events.length} events`);
       for (const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
+      return;
+    }
+
+    if (data.type === 'ping') {
+      if (!myId) return;
+      resetHeartbeat(myId);
       return;
     }
 
@@ -174,10 +193,12 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     if (myId) {
+      if (heartbeats.has(myId)) clearTimeout(heartbeats.get(myId));
+      heartbeats.delete(myId);
       peers.delete(myId);
       broadcastPresence(myId, false);
     }
   });
 });
 
-console.log(`[server] SQLite ready on ${process.env.PORT || 3000}`);
+console.log(`[server] SQLite + heartbeat ready on ${process.env.PORT || 3000}`);
