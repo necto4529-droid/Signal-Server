@@ -5,13 +5,8 @@ const path = require('path');
 const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 const peers = new Map();
 
-// Офлайн-очередь сообщений
 const STORAGE_FILE = path.join(__dirname, 'offline_messages.json');
 let queue = {};
-
-// Push-подписки
-const PUSH_SUBS_FILE = path.join(__dirname, 'push_subscriptions.json');
-let pushSubscriptions = {}; // userId -> playerId
 
 try {
   if (fs.existsSync(STORAGE_FILE)) {
@@ -22,23 +17,9 @@ try {
   console.error('[server] Failed to load queue', e);
 }
 
-try {
-  if (fs.existsSync(PUSH_SUBS_FILE)) {
-    pushSubscriptions = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, 'utf8'));
-    console.log('[server] Loaded push subscriptions from disk');
-  }
-} catch (e) {
-  console.error('[server] Failed to load push subscriptions', e);
-}
-
-function persistQueue() {
+function persist() {
   try { fs.writeFileSync(STORAGE_FILE, JSON.stringify(queue)); }
-  catch (e) { console.error('[server] persist queue error', e); }
-}
-
-function persistPushSubs() {
-  try { fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(pushSubscriptions)); }
-  catch (e) { console.error('[server] persist push subs error', e); }
+  catch (e) { console.error('[server] persist error', e); }
 }
 
 function send(ws, obj) {
@@ -53,19 +34,22 @@ function broadcastPresence(peerId, isOnline) {
   }
 }
 
-// --- Настройки OneSignal ---
+// --- Настройки OneSignal (оставь свои ключи) ---
 const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
-const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdx3m4534ns6ju3kudjv33pr4d26pdc2q54mewvbiihqhnhkdsiqacc4immi4ec7ymjn2t4mrakaf6juq';
+const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
+const pushSubscriptionsFile = path.join(__dirname, 'push_subscriptions.json');
+let pushSubscriptions = {};
+try {
+  if (fs.existsSync(pushSubscriptionsFile)) {
+    pushSubscriptions = JSON.parse(fs.readFileSync(pushSubscriptionsFile, 'utf8'));
+  }
+} catch (e) {}
 
 async function sendPushNotification(userId, message) {
   const playerId = pushSubscriptions[userId];
-  if (!playerId) {
-    console.log(`[push] Нет подписки для ${userId}`);
-    return;
-  }
-
+  if (!playerId) return;
   try {
-    const response = await fetch('https://onesignal.com/api/v1/notifications', {
+    await fetch('https://onesignal.com/api/v1/notifications', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -78,15 +62,9 @@ async function sendPushNotification(userId, message) {
         headings: { "en": "K-Chat" }
       })
     });
-
-    const data = await response.json();
-    if (data.errors) {
-      console.error('[push] Ошибка OneSignal:', data.errors);
-    } else {
-      console.log(`[push] Уведомление отправлено для ${userId}`);
-    }
+    console.log(`[push] Уведомление отправлено для ${userId}`);
   } catch (e) {
-    console.error('[push] Исключение при отправке:', e.message);
+    console.error('[push] Ошибка отправки:', e.message);
   }
 }
 
@@ -97,7 +75,7 @@ wss.on('connection', (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // ── REGISTER ────────────────────────────────────────────────
+    // --- REGISTER ---
     if (data.type === 'register') {
       myId = (data.peerId || '').toLowerCase();
       if (!myId) return;
@@ -111,32 +89,33 @@ wss.on('connection', (ws) => {
       if (pending.length > 0) {
         console.log(`[${myId}] delivering ${pending.length} queued items`);
         for (const m of pending) {
-          if (m.payload) {
+          if (m.type === 'incoming-msg') {
             send(ws, { type: 'incoming-msg', from: m.from, msgId: m.msgId, payload: m.payload });
           } else if (m.type === 'voice-listened') {
             send(ws, { type: 'voice-listened', from: m.from, voiceMsgId: m.voiceMsgId });
+          } else if (m.type === 'msg-delivered') {
+            send(ws, { type: 'msg-delivered', msgId: m.msgId, by: m.by });
           }
         }
-        queue[myId] = pending.filter(m => m.payload && !m.ephemeral);
-        if (!queue[myId].length) delete queue[myId];
-        persistQueue();
+        // Удаляем все доставленные события из очереди
+        delete queue[myId];
+        persist();
       }
       return;
     }
 
-    // ── REGISTER-PUSH (сохранение подписки) ─────────────────────
+    // --- REGISTER-PUSH ---
     if (data.type === 'register-push') {
       if (!myId) return;
       const { playerId } = data;
       if (!playerId) return;
-
       pushSubscriptions[myId] = playerId;
-      persistPushSubs();
+      fs.writeFileSync(pushSubscriptionsFile, JSON.stringify(pushSubscriptions));
       console.log(`[push] Подписка сохранена для ${myId}`);
       return;
     }
 
-    // ── SEND-MSG ────────────────────────────────────────────────
+    // --- SEND-MSG ---
     if (data.type === 'send-msg') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -150,26 +129,25 @@ wss.on('connection', (ws) => {
         if (!ephemeral) {
           if (!queue[target]) queue[target] = [];
           if (!queue[target].find(m => m.msgId === msgId)) {
-            queue[target].push({ msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
-            persistQueue();
+            queue[target].push({ type: 'incoming-msg', msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
+            persist();
           }
         }
       } else {
         if (!ephemeral) {
           if (!queue[target]) queue[target] = [];
           if (!queue[target].find(m => m.msgId === msgId)) {
-            queue[target].push({ msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
-            persistQueue();
+            queue[target].push({ type: 'incoming-msg', msgId, from: myId, payload, ts: Date.now(), ephemeral: false });
+            persist();
             console.log(`[${myId}] → [${target}] queued (offline)`);
           }
         }
-        // Отправляем пуш-уведомление получателю (если он офлайн)
         sendPushNotification(target, 'У вас новое сообщение').catch(console.warn);
       }
       return;
     }
 
-    // ── ACK-MSG ────────────────────────────────────────────────
+    // --- ACK-MSG (теперь сохраняет msg-delivered, если отправитель офлайн) ---
     if (data.type === 'ack-msg') {
       if (!myId) return;
       const { msgId } = data;
@@ -182,7 +160,7 @@ wss.on('connection', (ws) => {
       if (queue[myId]) {
         queue[myId] = queue[myId].filter(m => m.msgId !== msgId);
         if (!queue[myId].length) delete queue[myId];
-        persistQueue();
+        persist();
       }
 
       console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
@@ -191,22 +169,27 @@ wss.on('connection', (ws) => {
         const senderWs = peers.get(senderId);
         if (senderWs && senderWs.readyState === WebSocket.OPEN) {
           send(senderWs, { type: 'msg-delivered', msgId, by: myId });
+        } else {
+          // Отправитель офлайн – сохраняем уведомление о доставке в его очередь
+          if (!queue[senderId]) queue[senderId] = [];
+          queue[senderId].push({ type: 'msg-delivered', msgId, by: myId, ts: Date.now() });
+          persist();
+          console.log(`[${myId}] msg-delivered queued for offline sender ${senderId}`);
         }
       }
       return;
     }
 
-    // ── QUERY-PRESENCE ─────────────────────────────────────────
+    // --- QUERY-PRESENCE ---
     if (data.type === 'query-presence') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
-      const targetWs = peers.get(target);
-      const isOnline = !!(targetWs && targetWs.readyState === WebSocket.OPEN);
+      const isOnline = peers.has(target);
       send(ws, { type: 'presence-reply', target, online: isOnline });
       return;
     }
 
-    // ── VOICE-LISTENED ─────────────────────────────────────────
+    // --- VOICE-LISTENED (сохраняет в очередь отправителя, если он офлайн) ---
     if (data.type === 'voice-listened') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -223,13 +206,13 @@ wss.on('connection', (ws) => {
           voiceMsgId: data.voiceMsgId,
           ts: Date.now()
         });
-        persistQueue();
-        console.log(`[${myId}] → [${target}] voice-listened queued (offline)`);
+        persist();
+        console.log(`[${myId}] → [${target}] voice-listened queued (offline sender)`);
       }
       return;
     }
 
-    // ── Legacy signal ──────────────────────────────────────────
+    // --- Legacy signal ---
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
       if (targetWs && targetWs.readyState === WebSocket.OPEN)
