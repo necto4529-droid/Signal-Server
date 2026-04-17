@@ -3,5 +3,8 @@
   "version": "1.0.0",
   "engines": { "node": ">=18.0.0" },
   "scripts": { "start": "node server.js" },
-  "dependencies": { "ws": "^8.13.0" }
+  "dependencies": {
+    "ws": "^8.18.1",
+    "better-sqlite3": "^11.9.1"
+  }
 }
