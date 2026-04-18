@@ -98,8 +98,19 @@ wss.on('connection', (ws) => {
     try { data = JSON.parse(raw); } catch { return; }
 
     if (data.type === 'register') {
-      myId = (data.peerId || '').toLowerCase();
-      if (!myId) return;
+      const newId = (data.peerId || '').toLowerCase();
+      if (!newId) return;
+
+      // Закрываем старое соединение с таким же ID, если оно есть
+      if (peers.has(newId)) {
+        const oldWs = peers.get(newId);
+        if (oldWs && oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
+          console.log(`[${newId}] duplicate connection, closing old one`);
+          oldWs.close();
+        }
+      }
+
+      myId = newId;
       peers.set(myId, ws);
       console.log(`[${myId}] registered`);
       send(ws, { type: 'registered' });
@@ -150,14 +161,21 @@ wss.on('connection', (ws) => {
       if (!myId) return;
       const { msgId } = data;
       if (!msgId) return;
+      console.log(`[ack-msg] from ${myId} for msgId ${msgId}`);
       if (deleteIncomingMsg(myId, msgId)) {
         const senderId = getSenderOfMsg(myId, msgId);
-        console.log(`[${myId}] ACK ${msgId}, sender=${senderId}`);
+        console.log(`[ack-msg] deleted incoming, sender=${senderId}`);
         if (senderId) {
           const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
+          console.log(`[ack-msg] enqueued msg-delivered for ${senderId}, eventId=${eventId}`);
           const senderWs = peers.get(senderId);
-          if (senderWs) send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+          if (senderWs) {
+            send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+            console.log(`[ack-msg] sent live msg-delivered to ${senderId}`);
+          }
         }
+      } else {
+        console.log(`[ack-msg] incoming msg ${msgId} not found (already acked?)`);
       }
       return;
     }
@@ -195,8 +213,14 @@ wss.on('connection', (ws) => {
     if (myId) {
       if (heartbeats.has(myId)) clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
-      peers.delete(myId);
-      broadcastPresence(myId, false);
+      // Удаляем только если это текущее соединение
+      if (peers.get(myId) === ws) {
+        peers.delete(myId);
+        broadcastPresence(myId, false);
+        console.log(`[${myId}] disconnected (clean)`);
+      } else {
+        console.log(`[${myId}] disconnected but connection already replaced`);
+      }
     }
   });
 });
