@@ -22,7 +22,10 @@ db.exec(`
 // --- Push-подписки ---
 const pushSubscriptionsFile = path.join(__dirname, 'push_subscriptions.json');
 let pushSubscriptions = {};
-try { if (fs.existsSync(pushSubscriptionsFile)) pushSubscriptions = JSON.parse(fs.readFileSync(pushSubscriptionsFile, 'utf8')); } catch (e) {}
+try {
+  if (fs.existsSync(pushSubscriptionsFile))
+    pushSubscriptions = JSON.parse(fs.readFileSync(pushSubscriptionsFile, 'utf8'));
+} catch (e) {}
 
 const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
 const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
@@ -33,8 +36,16 @@ async function sendPushNotification(userId, message) {
   try {
     await fetch('https://onesignal.com/api/v1/notifications', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${ONESIGNAL_REST_API_KEY}` },
-      body: JSON.stringify({ app_id: ONESIGNAL_APP_ID, include_player_ids: [playerId], contents: { "en": message }, headings: { "en": "K-Chat" } })
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Basic ${ONESIGNAL_REST_API_KEY}`
+      },
+      body: JSON.stringify({
+        app_id: ONESIGNAL_APP_ID,
+        include_player_ids: [playerId],
+        contents: { en: message },
+        headings: { en: 'K-Chat' }
+      })
     });
   } catch (e) {}
 }
@@ -43,10 +54,13 @@ const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 const peers = new Map();
 
 // Heartbeat
-const HEARTBEAT_TIMEOUT = 60000; // 60 секунд
+const HEARTBEAT_TIMEOUT = 60000;
 const heartbeats = new Map();
 
-function send(ws, obj) { if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); }
+function send(ws, obj) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
 function broadcastPresence(peerId, isOnline) {
   const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
   for (const [, ws] of peers) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -61,17 +75,22 @@ function resetHeartbeat(peerId) {
   heartbeats.set(peerId, timeout);
 }
 
-// Добавление события (синхронно)
+// Добавление события (синхронно), возвращает id новой записи
 function enqueueEvent(recipientId, type, payload) {
-  const stmt = db.prepare(`INSERT INTO events (recipient_id, type, payload, created_at) VALUES (?, ?, ?, ?)`);
-  stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
-  console.log(`[enqueue] ${recipientId} <- ${type}`);
+  const stmt = db.prepare(
+    `INSERT INTO events (recipient_id, type, payload, created_at) VALUES (?, ?, ?, ?)`
+  );
+  const info = stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
+  console.log(`[enqueue] ${recipientId} <- ${type} (id=${info.lastInsertRowid})`);
+  return info.lastInsertRowid;
 }
 
-// Получение событий (без удаления)
+// Получение всех событий для получателя
 function getEvents(recipientId) {
-  const stmt = db.prepare(`SELECT * FROM events WHERE recipient_id = ? ORDER BY created_at`);
-  return stmt.all(recipientId).map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
+  return db
+    .prepare(`SELECT * FROM events WHERE recipient_id = ? ORDER BY created_at`)
+    .all(recipientId)
+    .map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
 }
 
 // Удаление одного события по ID
@@ -79,15 +98,27 @@ function deleteEvent(eventId) {
   db.prepare(`DELETE FROM events WHERE id = ?`).run(eventId);
 }
 
-// Удаление входящего сообщения по msgId (для ack-msg)
-function deleteIncomingMsg(recipientId, msgId) {
-  const stmt = db.prepare(`DELETE FROM events WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ?`);
-  return stmt.run(recipientId, msgId).changes > 0;
-}
+// ── КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ ──
+// Сначала ПОЛУЧАЕМ отправителя, потом УДАЛЯЕМ запись.
+// Раньше getSenderOfMsg вызывался ПОСЛЕ deleteIncomingMsg — строки уже не было.
+function ackIncomingMsg(recipientId, msgId) {
+  // 1. Получаем отправителя из записи (пока она ещё существует)
+  const row = db
+    .prepare(
+      `SELECT id, json_extract(payload, '$.from') as sender
+       FROM events
+       WHERE recipient_id = ? AND type = 'incoming-msg'
+         AND json_extract(payload, '$.msgId') = ?
+       LIMIT 1`
+    )
+    .get(recipientId, msgId);
 
-function getSenderOfMsg(recipientId, msgId) {
-  const row = db.prepare(`SELECT json_extract(payload, '$.from') as sender FROM events WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ? LIMIT 1`).get(recipientId, msgId);
-  return row?.sender;
+  if (!row) return null; // уже удалено / не было
+
+  // 2. Удаляем запись
+  db.prepare(`DELETE FROM events WHERE id = ?`).run(row.id);
+
+  return row.sender; // возвращаем ID отправителя
 }
 
 wss.on('connection', (ws) => {
@@ -97,11 +128,11 @@ wss.on('connection', (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
+    // ── register ──
     if (data.type === 'register') {
       const newId = (data.peerId || '').toLowerCase();
       if (!newId) return;
 
-      // Закрываем старое соединение с таким же ID, если оно есть
       if (peers.has(newId)) {
         const oldWs = peers.get(newId);
         if (oldWs && oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
@@ -123,12 +154,14 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── ping ──
     if (data.type === 'ping') {
       if (!myId) return;
       resetHeartbeat(myId);
       return;
     }
 
+    // ── register-push ──
     if (data.type === 'register-push') {
       if (!myId) return;
       const { playerId } = data;
@@ -139,6 +172,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── send-msg ──
     if (data.type === 'send-msg') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -151,28 +185,31 @@ wss.on('connection', (ws) => {
         console.log(`[${myId}] → [${target}] live`);
       } else {
         console.log(`[${myId}] → [${target}] queued`);
-        sendPushNotification(target, 'Новое сообщение').catch(()=>{});
+        sendPushNotification(target, 'Новое сообщение').catch(() => {});
       }
       if (!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
       return;
     }
 
+    // ── ack-msg ──
     if (data.type === 'ack-msg') {
       if (!myId) return;
       const { msgId } = data;
       if (!msgId) return;
+
       console.log(`[ack-msg] from ${myId} for msgId ${msgId}`);
-      if (deleteIncomingMsg(myId, msgId)) {
-        const senderId = getSenderOfMsg(myId, msgId);
+
+      // ИСПРАВЛЕНИЕ: получаем отправителя и удаляем запись за один вызов
+      const senderId = ackIncomingMsg(myId, msgId);
+
+      if (senderId) {
         console.log(`[ack-msg] deleted incoming, sender=${senderId}`);
-        if (senderId) {
-          const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
-          console.log(`[ack-msg] enqueued msg-delivered for ${senderId}, eventId=${eventId}`);
-          const senderWs = peers.get(senderId);
-          if (senderWs) {
-            send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
-            console.log(`[ack-msg] sent live msg-delivered to ${senderId}`);
-          }
+        const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
+        console.log(`[ack-msg] enqueued msg-delivered for ${senderId}, eventId=${eventId}`);
+        const senderWs = peers.get(senderId);
+        if (senderWs) {
+          send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+          console.log(`[ack-msg] sent live msg-delivered to ${senderId}`);
         }
       } else {
         console.log(`[ack-msg] incoming msg ${msgId} not found (already acked?)`);
@@ -180,6 +217,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── ack-event ──
     if (data.type === 'ack-event') {
       if (!myId) return;
       const { eventId } = data;
@@ -187,6 +225,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── query-presence ──
     if (data.type === 'query-presence') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -194,15 +233,27 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── voice-listened ──
     if (data.type === 'voice-listened') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
+      const eventId = enqueueEvent(target, 'voice-listened', {
+        from: myId,
+        voiceMsgId: data.voiceMsgId
+      });
       const targetWs = peers.get(target);
-      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
-      if (targetWs) send(targetWs, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
+      if (targetWs) {
+        send(targetWs, {
+          type: 'voice-listened',
+          from: myId,
+          voiceMsgId: data.voiceMsgId,
+          eventId
+        });
+      }
       return;
     }
 
+    // ── signal (WebRTC) ──
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
       if (targetWs) send(targetWs, { type: 'signal', from: myId, payload: data.payload });
@@ -213,7 +264,6 @@ wss.on('connection', (ws) => {
     if (myId) {
       if (heartbeats.has(myId)) clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
-      // Удаляем только если это текущее соединение
       if (peers.get(myId) === ws) {
         peers.delete(myId);
         broadcastPresence(myId, false);
