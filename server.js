@@ -2,14 +2,12 @@ const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
 
 // --- БД SQLite с WAL-режимом ---
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 
-// Таблицы для офлайн-событий (существующие)
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,28 +17,25 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
-`);
 
-// Новые таблицы для групп
-db.exec(`
   CREATE TABLE IF NOT EXISTS groups (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    description TEXT DEFAULT '',
-    avatar TEXT DEFAULT '👥',
-    creator_id TEXT NOT NULL,
-    invite_token TEXT UNIQUE NOT NULL,
-    created_at INTEGER NOT NULL
+    description TEXT,
+    avatar TEXT,
+    admin_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    password_hash TEXT NOT NULL
   );
+
   CREATE TABLE IF NOT EXISTS group_members (
     group_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
-    role TEXT NOT NULL DEFAULT 'member', -- 'admin' или 'member'
     joined_at INTEGER NOT NULL,
     PRIMARY KEY (group_id, user_id),
     FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
   );
-  CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members (user_id);
+  CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
 `);
 
 // --- Push-подписки ---
@@ -76,6 +71,7 @@ async function sendPushNotification(userId, message) {
 
 const wss = new WebSocket.Server({ port: process.env.PORT || 3000 });
 const peers = new Map();
+const MAX_GROUP_MEMBERS = 20;
 
 // Heartbeat
 const HEARTBEAT_TIMEOUT = 60000;
@@ -99,7 +95,6 @@ function resetHeartbeat(peerId) {
   heartbeats.set(peerId, timeout);
 }
 
-// Добавление события (синхронно), возвращает id новой записи
 function enqueueEvent(recipientId, type, payload) {
   const stmt = db.prepare(
     `INSERT INTO events (recipient_id, type, payload, created_at) VALUES (?, ?, ?, ?)`
@@ -109,7 +104,6 @@ function enqueueEvent(recipientId, type, payload) {
   return info.lastInsertRowid;
 }
 
-// Получение всех событий для получателя
 function getEvents(recipientId) {
   return db
     .prepare(`SELECT * FROM events WHERE recipient_id = ? ORDER BY created_at`)
@@ -117,12 +111,10 @@ function getEvents(recipientId) {
     .map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
 }
 
-// Удаление одного события по ID
 function deleteEvent(eventId) {
   db.prepare(`DELETE FROM events WHERE id = ?`).run(eventId);
 }
 
-// Подтверждение получения входящего сообщения (возвращает отправителя)
 function ackIncomingMsg(recipientId, msgId) {
   const row = db
     .prepare(
@@ -139,42 +131,35 @@ function ackIncomingMsg(recipientId, msgId) {
   return row.sender;
 }
 
-// Генерация invite токена
-function generateInviteToken() {
-  return crypto.randomBytes(12).toString('hex'); // 24 символа
-}
-
-// --- Работа с группами ---
-
-// Получить участников группы
+// --- Групповые функции ---
 function getGroupMembers(groupId) {
-  return db.prepare(`SELECT user_id, role FROM group_members WHERE group_id = ?`).all(groupId);
+  return db.prepare(`SELECT user_id FROM group_members WHERE group_id = ?`).all(groupId).map(r => r.user_id);
 }
 
-// Проверить, является ли пользователь участником
 function isGroupMember(groupId, userId) {
-  return db.prepare(`SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?`).get(groupId, userId) !== undefined;
+  const row = db.prepare(`SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?`).get(groupId, userId);
+  return !!row;
 }
 
-// Получить роль пользователя в группе
-function getUserRole(groupId, userId) {
-  const row = db.prepare(`SELECT role FROM group_members WHERE group_id = ? AND user_id = ?`).get(groupId, userId);
-  return row ? row.role : null;
+function addGroupMember(groupId, userId) {
+  db.prepare(`INSERT OR IGNORE INTO group_members (group_id, user_id, joined_at) VALUES (?, ?, ?)`).run(groupId, userId, Date.now());
 }
 
-// Отправить событие всем участникам группы (кроме исключённого)
-function broadcastToGroup(groupId, type, payload, excludeUserId = null) {
+function removeGroupMember(groupId, userId) {
+  db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).run(groupId, userId);
+}
+
+function broadcastToGroup(groupId, senderId, message) {
   const members = getGroupMembers(groupId);
-  for (const m of members) {
-    if (m.user_id === excludeUserId) continue;
-    const targetWs = peers.get(m.user_id);
-    const eventId = enqueueEvent(m.user_id, type, payload);
-    if (targetWs) {
-      send(targetWs, { type, ...payload, eventId });
+  members.forEach(memberId => {
+    if (memberId === senderId) return;
+    const ws = peers.get(memberId);
+    if (ws) {
+      send(ws, message);
     } else {
-      sendPushNotification(m.user_id, 'Новое сообщение в группе').catch(() => {});
+      enqueueEvent(memberId, message.type, message);
     }
-  }
+  });
 }
 
 wss.on('connection', (ws) => {
@@ -228,50 +213,75 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── send-msg (личное или групповое) ──
+    // ── create-group ──
+    if (data.type === 'create-group') {
+      if (!myId) return;
+      const { groupId, name, description, avatar, passwordHash } = data;
+      if (!groupId || !name || !passwordHash) return;
+      try {
+        db.prepare(`INSERT INTO groups (id, name, description, avatar, admin_id, created_at, password_hash) VALUES (?,?,?,?,?,?,?)`)
+          .run(groupId, name, description || '', avatar || '👥', myId, Date.now(), passwordHash);
+        addGroupMember(groupId, myId);
+        send(ws, { type: 'group-created', groupId });
+      } catch (e) {
+        send(ws, { type: 'error', message: 'Group already exists' });
+      }
+      return;
+    }
+
+    // ── join-group ──
+    if (data.type === 'join-group') {
+      if (!myId) return;
+      const { inviteCode, passwordHash } = data;
+      const group = db.prepare(`SELECT * FROM groups WHERE id = ?`).get(inviteCode);
+      if (!group) { send(ws, { type: 'error', message: 'Group not found' }); return; }
+      if (group.password_hash !== passwordHash) { send(ws, { type: 'error', message: 'Wrong password' }); return; }
+      const members = getGroupMembers(inviteCode);
+      if (members.length >= MAX_GROUP_MEMBERS) { send(ws, { type: 'error', message: 'Group full' }); return; }
+      addGroupMember(inviteCode, myId);
+      send(ws, { type: 'group-joined', group });
+      const joinMsg = { type: 'group-member-joined', groupId: inviteCode, userId: myId };
+      broadcastToGroup(inviteCode, myId, joinMsg);
+      return;
+    }
+
+    // ── leave-group ──
+    if (data.type === 'leave-group') {
+      if (!myId) return;
+      const { groupId } = data;
+      removeGroupMember(groupId, myId);
+      const members = getGroupMembers(groupId);
+      if (members.length === 0) {
+        db.prepare(`DELETE FROM groups WHERE id = ?`).run(groupId);
+      }
+      const leaveMsg = { type: 'group-member-left', groupId, userId: myId };
+      broadcastToGroup(groupId, myId, leaveMsg);
+      return;
+    }
+
+    // ── send-msg ──
     if (data.type === 'send-msg') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
       const { msgId, payload, ephemeral } = data;
       if (!target || !msgId || !payload) return;
 
-      // Проверяем, является ли target группой (начинается с "group:")
-      if (target.startsWith('group:')) {
-        const groupId = target.substring(6);
-        // Проверяем, состоит ли отправитель в группе
-        if (!isGroupMember(groupId, myId)) {
-          console.log(`[send-msg] user ${myId} not in group ${groupId}`);
-          return;
-        }
-        // Рассылаем всем участникам, кроме отправителя
-        const members = getGroupMembers(groupId);
-        for (const m of members) {
-          if (m.user_id === myId) continue;
-          const targetWs = peers.get(m.user_id);
-          const eventId = ephemeral ? null : enqueueEvent(m.user_id, 'incoming-msg', {
-            from: myId,
-            msgId,
-            payload,
-            groupId: groupId
+      // Проверяем, группа ли это
+      const group = db.prepare(`SELECT id FROM groups WHERE id = ?`).get(target);
+      if (group) {
+        if (!isGroupMember(target, myId)) return;
+        const incoming = { type: 'incoming-msg', from: myId, msgId, payload };
+        broadcastToGroup(target, myId, incoming);
+        if (!ephemeral) {
+          const members = getGroupMembers(target);
+          members.forEach(memberId => {
+            if (memberId !== myId) enqueueEvent(memberId, 'incoming-msg', { from: myId, msgId, payload });
           });
-          if (targetWs) {
-            send(targetWs, {
-              type: 'incoming-msg',
-              from: myId,
-              msgId,
-              payload,
-              groupId: groupId,
-              eventId
-            });
-          } else if (!ephemeral) {
-            sendPushNotification(m.user_id, 'Новое сообщение в группе').catch(() => {});
-          }
         }
-        console.log(`[${myId}] → group ${groupId} (${members.length - 1} recipients)`);
         return;
       }
 
-      // Личное сообщение
+      // Обычный чат 1-1
       const targetWs = peers.get(target);
       if (targetWs) {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
@@ -292,12 +302,27 @@ wss.on('connection', (ws) => {
 
       console.log(`[ack-msg] from ${myId} for msgId ${msgId}`);
       const senderId = ackIncomingMsg(myId, msgId);
+
       if (senderId) {
-        console.log(`[ack-msg] deleted incoming, sender=${senderId}`);
-        const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
-        const senderWs = peers.get(senderId);
-        if (senderWs) {
-          send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+        // Проверяем, является ли senderId группой
+        const group = db.prepare(`SELECT id FROM groups WHERE id = ?`).get(senderId);
+        if (group) {
+          // Групповое сообщение: отправляем msg-read всем участникам
+          const readMsg = { type: 'msg-read', msgId, groupId: senderId, readerId: myId };
+          broadcastToGroup(senderId, myId, readMsg);
+          // Сохраняем в офлайн-очередь для отсутствующих
+          const members = getGroupMembers(senderId);
+          members.forEach(memberId => {
+            if (memberId !== myId) enqueueEvent(memberId, 'msg-read', readMsg);
+          });
+        } else {
+          // Личное сообщение: отправляем msg-delivered отправителю
+          const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
+          const senderWs = peers.get(senderId);
+          if (senderWs) {
+            send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+            console.log(`[ack-msg] sent live msg-delivered to ${senderId}`);
+          }
         }
       } else {
         console.log(`[ack-msg] incoming msg ${msgId} not found (already acked?)`);
@@ -345,232 +370,6 @@ wss.on('connection', (ws) => {
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
       if (targetWs) send(targetWs, { type: 'signal', from: myId, payload: data.payload });
-      return;
-    }
-
-    // ── create_group ──
-    if (data.type === 'create_group') {
-      if (!myId) return;
-      const { name, description, avatar } = data;
-      if (!name) return;
-
-      const groupId = 'grp_' + crypto.randomBytes(8).toString('hex');
-      const inviteToken = generateInviteToken();
-      const now = Date.now();
-
-      const insertGroup = db.prepare(`
-        INSERT INTO groups (id, name, description, avatar, creator_id, invite_token, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `);
-      insertGroup.run(groupId, name, description || '', avatar || '👥', myId, inviteToken, now);
-
-      const insertMember = db.prepare(`
-        INSERT INTO group_members (group_id, user_id, role, joined_at)
-        VALUES (?, ?, 'admin', ?)
-      `);
-      insertMember.run(groupId, myId, now);
-
-      // Отправляем создателю подтверждение
-      send(ws, {
-        type: 'group_created',
-        groupId,
-        name,
-        description,
-        avatar,
-        inviteToken,
-        isAdmin: true
-      });
-
-      console.log(`[${myId}] created group ${groupId} (${name})`);
-      return;
-    }
-
-    // ── join_group ──
-    if (data.type === 'join_group') {
-      if (!myId) return;
-      const { inviteToken } = data;
-      if (!inviteToken) return;
-
-      const group = db.prepare(`SELECT * FROM groups WHERE invite_token = ?`).get(inviteToken);
-      if (!group) {
-        send(ws, { type: 'join_group_error', error: 'invalid_token' });
-        return;
-      }
-
-      const groupId = group.id;
-      if (isGroupMember(groupId, myId)) {
-        send(ws, { type: 'join_group_error', error: 'already_member' });
-        return;
-      }
-
-      // Проверяем лимит участников (20)
-      const memberCount = db.prepare(`SELECT COUNT(*) as cnt FROM group_members WHERE group_id = ?`).get(groupId).cnt;
-      if (memberCount >= 20) {
-        send(ws, { type: 'join_group_error', error: 'group_full' });
-        return;
-      }
-
-      const now = Date.now();
-      db.prepare(`INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)`)
-        .run(groupId, myId, now);
-
-      // Уведомляем всех участников о новом участнике
-      const newMemberEvent = {
-        type: 'group_member_joined',
-        groupId,
-        userId: myId,
-        joinedAt: now
-      };
-      broadcastToGroup(groupId, 'group_member_joined', newMemberEvent, myId);
-
-      // Отправляем информацию о группе новому участнику
-      const members = getGroupMembers(groupId).map(m => ({ userId: m.user_id, role: m.role }));
-      send(ws, {
-        type: 'group_joined',
-        groupId,
-        name: group.name,
-        description: group.description,
-        avatar: group.avatar,
-        inviteToken: group.invite_token,
-        members,
-        isAdmin: false
-      });
-
-      console.log(`[${myId}] joined group ${groupId}`);
-      return;
-    }
-
-    // ── get_group_info ──
-    if (data.type === 'get_group_info') {
-      if (!myId) return;
-      const { groupId } = data;
-      if (!groupId) return;
-
-      const group = db.prepare(`SELECT * FROM groups WHERE id = ?`).get(groupId);
-      if (!group) {
-        send(ws, { type: 'group_info_error', error: 'not_found' });
-        return;
-      }
-
-      if (!isGroupMember(groupId, myId)) {
-        send(ws, { type: 'group_info_error', error: 'not_member' });
-        return;
-      }
-
-      const members = getGroupMembers(groupId).map(m => ({ userId: m.user_id, role: m.role }));
-      const role = getUserRole(groupId, myId);
-      send(ws, {
-        type: 'group_info',
-        groupId,
-        name: group.name,
-        description: group.description,
-        avatar: group.avatar,
-        inviteToken: group.invite_token,
-        members,
-        isAdmin: role === 'admin'
-      });
-      return;
-    }
-
-    // ── update_group ──
-    if (data.type === 'update_group') {
-      if (!myId) return;
-      const { groupId, name, description, avatar } = data;
-      if (!groupId) return;
-
-      const role = getUserRole(groupId, myId);
-      if (role !== 'admin') {
-        send(ws, { type: 'update_group_error', error: 'not_admin' });
-        return;
-      }
-
-      const updates = [];
-      const params = [];
-      if (name !== undefined) { updates.push('name = ?'); params.push(name); }
-      if (description !== undefined) { updates.push('description = ?'); params.push(description); }
-      if (avatar !== undefined) { updates.push('avatar = ?'); params.push(avatar); }
-      if (updates.length === 0) return;
-
-      params.push(groupId);
-      db.prepare(`UPDATE groups SET ${updates.join(', ')} WHERE id = ?`).run(...params);
-
-      // Оповещаем всех участников об обновлении
-      broadcastToGroup(groupId, 'group_updated', {
-        groupId,
-        name,
-        description,
-        avatar
-      });
-
-      send(ws, { type: 'group_updated_ack', groupId });
-      return;
-    }
-
-    // ── remove_member ──
-    if (data.type === 'remove_member') {
-      if (!myId) return;
-      const { groupId, userId } = data;
-      if (!groupId || !userId) return;
-
-      const role = getUserRole(groupId, myId);
-      if (role !== 'admin') {
-        send(ws, { type: 'remove_member_error', error: 'not_admin' });
-        return;
-      }
-
-      if (userId === myId) {
-        send(ws, { type: 'remove_member_error', error: 'cannot_remove_self' });
-        return;
-      }
-
-      if (!isGroupMember(groupId, userId)) {
-        send(ws, { type: 'remove_member_error', error: 'not_member' });
-        return;
-      }
-
-      db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).run(groupId, userId);
-
-      // Уведомляем удалённого пользователя и остальных
-      const removedWs = peers.get(userId);
-      if (removedWs) {
-        send(removedWs, { type: 'kicked_from_group', groupId });
-      }
-      // Можно также добавить событие в очередь для офлайн
-      enqueueEvent(userId, 'kicked_from_group', { groupId });
-
-      broadcastToGroup(groupId, 'group_member_removed', {
-        groupId,
-        userId,
-        by: myId
-      });
-
-      send(ws, { type: 'remove_member_ack', groupId, userId });
-      return;
-    }
-
-    // ── leave_group ──
-    if (data.type === 'leave_group') {
-      if (!myId) return;
-      const { groupId } = data;
-      if (!groupId) return;
-
-      if (!isGroupMember(groupId, myId)) {
-        send(ws, { type: 'leave_group_error', error: 'not_member' });
-        return;
-      }
-
-      const role = getUserRole(groupId, myId);
-      // Если админ покидает группу и он единственный админ, можно передать права или удалить группу
-      // Для простоты: если админ уходит, группа остаётся без админа (можно доработать)
-      db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).run(groupId, myId);
-
-      broadcastToGroup(groupId, 'group_member_left', {
-        groupId,
-        userId: myId
-      });
-
-      send(ws, { type: 'left_group_ack', groupId });
-      return;
     }
   });
 
@@ -589,4 +388,4 @@ wss.on('connection', (ws) => {
   });
 });
 
-console.log(`[server] SQLite + groups ready on ${process.env.PORT || 3000}`);
+console.log(`[server] SQLite + groups + heartbeat ready on ${process.env.PORT || 3000}`);
