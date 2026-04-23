@@ -312,7 +312,11 @@ wss.on('connection', (ws, req) => {
       if (members.find(m => m.user_id === myId)) { send(ws, { type: 'error', message: 'Already a member' }); return; }
       db.prepare(`INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)`)
         .run(groupId, myId, Date.now());
+      
+      // Отправляем подтверждение с реальным именем группы
       send(ws, { type: 'group-joined', groupId, name: group.name, avatar: group.avatar });
+      
+      // Уведомляем других онлайн участников
       for (const member of members) {
         const memberWs = peers.get(member.user_id);
         if (memberWs) send(memberWs, { type: 'group-member-joined', groupId, userId: myId });
@@ -327,7 +331,6 @@ wss.on('connection', (ws, req) => {
       const group = db.prepare(`SELECT * FROM groups WHERE group_id = ?`).get(groupId);
       if (!group) { send(ws, { type: 'error', message: 'Group not found' }); return; }
       const members = getGroupMembers(groupId);
-      // Здесь можно добавить имена пользователей из контактов, но для простоты вернём id
       send(ws, {
         type: 'group-info',
         groupId,
