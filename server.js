@@ -2,7 +2,7 @@ const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
+const https = require('https'); // для самопинга
 
 // --- БД SQLite с WAL-режимом ---
 const dbPath = path.join(__dirname, 'offline_queue.db');
@@ -20,46 +20,21 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
 `);
 
+// Таблица групп
 db.exec(`
   CREATE TABLE IF NOT EXISTS groups (
-    group_id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
-    description TEXT,
-    avatar TEXT DEFAULT '👥',
     creator_id TEXT NOT NULL,
+    invite_code TEXT UNIQUE NOT NULL,
+    avatar TEXT DEFAULT '👥',
+    description TEXT DEFAULT '',
+    members TEXT DEFAULT '[]',
     created_at INTEGER NOT NULL
   );
-  CREATE TABLE IF NOT EXISTS group_members (
-    group_id TEXT NOT NULL,
-    user_id TEXT NOT NULL,
-    role TEXT DEFAULT 'member',
-    joined_at INTEGER NOT NULL,
-    PRIMARY KEY (group_id, user_id)
-  );
-  CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members (user_id);
-  
-  CREATE TABLE IF NOT EXISTS group_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    recipient_id TEXT NOT NULL,
-    group_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_group_events_recipient ON group_events (recipient_id);
 `);
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS group_messages (
-    msg_id TEXT PRIMARY KEY,
-    group_id TEXT NOT NULL,
-    sender_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages (group_id);
-`);
-
-// Push-подписки
+// --- Push-подписки ---
 const pushSubscriptionsFile = path.join(__dirname, 'push_subscriptions.json');
 let pushSubscriptions = {};
 try {
@@ -74,7 +49,7 @@ async function sendPushNotification(userId, message) {
   const playerId = pushSubscriptions[userId];
   if (!playerId) return;
   try {
-    await fetch('https://onesignal.com/api/v1/notifications', {
+    await fetch('https://onesignal.com', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -94,6 +69,7 @@ const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 const peers = new Map();
 
+// Heartbeat
 const HEARTBEAT_TIMEOUT = 60000;
 const heartbeats = new Map();
 
@@ -109,67 +85,24 @@ function broadcastPresence(peerId, isOnline) {
 function resetHeartbeat(peerId) {
   if (heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
   const timeout = setTimeout(() => {
+    console.log(`[${peerId}] heartbeat timeout, forcing offline`);
     if (peers.has(peerId)) peers.get(peerId).close();
   }, HEARTBEAT_TIMEOUT);
   heartbeats.set(peerId, timeout);
 }
 
-function isGroupMember(groupId, userId) {
-  const row = db.prepare(`SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?`).get(groupId, userId);
-  return !!row;
-}
-
-function getGroupMembers(groupId) {
-  return db.prepare(`SELECT user_id, role FROM group_members WHERE group_id = ?`).all(groupId);
-}
-
-function enqueueGroupEvent(recipientId, groupId, type, payload) {
-  const stmt = db.prepare(
-    `INSERT INTO group_events (recipient_id, group_id, type, payload, created_at) VALUES (?, ?, ?, ?, ?)`
-  );
-  stmt.run(recipientId, groupId, type, JSON.stringify(payload), Date.now());
-}
-
-function getGroupEvents(recipientId) {
-  return db.prepare(`SELECT * FROM group_events WHERE recipient_id = ? ORDER BY created_at`).all(recipientId)
-    .map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
-}
-
-function deleteGroupEvent(eventId) {
-  db.prepare(`DELETE FROM group_events WHERE id = ?`).run(eventId);
-}
-
-function deleteAllGroupEventsForUserInGroup(recipientId, groupId) {
-  db.prepare(`DELETE FROM group_events WHERE recipient_id = ? AND group_id = ?`).run(recipientId, groupId);
-}
-
-function saveGroupMessageInfo(msgId, groupId, senderId) {
-  db.prepare(`INSERT OR IGNORE INTO group_messages (msg_id, group_id, sender_id, created_at) VALUES (?, ?, ?, ?)`)
-    .run(msgId, groupId, senderId, Date.now());
-}
-
-function markGroupMessagesRead(groupId, readerId) {
-  const messages = db.prepare(`
-    SELECT msg_id, sender_id FROM group_messages 
-    WHERE group_id = ? AND sender_id != ?
-  `).all(groupId, readerId);
-  for (const msg of messages) {
-    const senderWs = peers.get(msg.sender_id);
-    if (senderWs) {
-      send(senderWs, { type: 'group-msg-read', groupId, msgId: msg.msg_id, reader: readerId });
-    }
-  }
-  db.prepare(`DELETE FROM group_messages WHERE group_id = ? AND sender_id != ?`).run(groupId, readerId);
-}
-
-// Вспомогательные функции для личных сообщений
 function enqueueEvent(recipientId, type, payload) {
-  const stmt = db.prepare(`INSERT INTO events (recipient_id, type, payload, created_at) VALUES (?, ?, ?, ?)`);
-  stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
+  const stmt = db.prepare(
+    `INSERT INTO events (recipient_id, type, payload, created_at) VALUES (?, ?, ?, ?)`
+  );
+  const info = stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
+  return info.lastInsertRowid;
 }
 
 function getEvents(recipientId) {
-  return db.prepare(`SELECT * FROM events WHERE recipient_id = ? ORDER BY created_at`).all(recipientId)
+  return db
+    .prepare(`SELECT * FROM events WHERE recipient_id = ? ORDER BY created_at`)
+    .all(recipientId)
     .map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
 }
 
@@ -178,16 +111,87 @@ function deleteEvent(eventId) {
 }
 
 function ackIncomingMsg(recipientId, msgId) {
-  const row = db.prepare(`
-    SELECT id, json_extract(payload, '$.from') as sender
-    FROM events WHERE recipient_id = ? AND type = 'incoming-msg' AND json_extract(payload, '$.msgId') = ? LIMIT 1
-  `).get(recipientId, msgId);
+  const row = db
+    .prepare(
+      `SELECT id, json_extract(payload, '$.from') as sender
+       FROM events
+       WHERE recipient_id = ? AND type = 'incoming-msg'
+         AND json_extract(payload, '$.msgId') = ?
+       LIMIT 1`
+    )
+    .get(recipientId, msgId);
+
   if (!row) return null;
   db.prepare(`DELETE FROM events WHERE id = ?`).run(row.id);
   return row.sender;
 }
 
-// Обработчик WebSocket
+// Работа с группами
+function getGroup(groupId) {
+  return db.prepare('SELECT * FROM groups WHERE id = ?').get(groupId);
+}
+
+function getGroupByInvite(code) {
+  return db.prepare('SELECT * FROM groups WHERE invite_code = ?').get(code);
+}
+
+function createGroup(group) {
+  const stmt = db.prepare(
+    'INSERT INTO groups (id, name, creator_id, invite_code, avatar, description, members, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  );
+  stmt.run(
+    group.id,
+    group.name,
+    group.creator_id,
+    group.invite_code,
+    group.avatar || '👥',
+    group.description || '',
+    JSON.stringify(group.members || []),
+    Date.now()
+  );
+}
+
+function updateGroup(groupId, changes) {
+  const group = getGroup(groupId);
+  if (!group) return;
+  const newMembers = changes.members
+    ? JSON.stringify(changes.members)
+    : group.members;
+  db.prepare(
+    'UPDATE groups SET name = ?, avatar = ?, description = ?, members = ? WHERE id = ?'
+  ).run(
+    changes.name || group.name,
+    changes.avatar || group.avatar,
+    changes.description || group.description,
+    newMembers,
+    groupId
+  );
+}
+
+function addMember(groupId, peerId) {
+  const group = getGroup(groupId);
+  if (!group) return false;
+  const members = JSON.parse(group.members);
+  if (members.includes(peerId)) return false;
+  if (members.length >= 20) return false; // лимит
+  members.push(peerId);
+  db.prepare('UPDATE groups SET members = ? WHERE id = ?').run(
+    JSON.stringify(members),
+    groupId
+  );
+  return true;
+}
+
+function removeMember(groupId, peerId) {
+  const group = getGroup(groupId);
+  if (!group) return;
+  const members = JSON.parse(group.members).filter(id => id !== peerId);
+  db.prepare('UPDATE groups SET members = ? WHERE id = ?').run(
+    JSON.stringify(members),
+    groupId
+  );
+}
+
 wss.on('connection', (ws, req) => {
   let myId = null;
 
@@ -200,31 +204,39 @@ wss.on('connection', (ws, req) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
+    // Регистрация
     if (data.type === 'register') {
       const newId = (data.peerId || '').toLowerCase();
       if (!newId) return;
+
       if (peers.has(newId)) {
         const oldWs = peers.get(newId);
-        if (oldWs && oldWs !== ws && oldWs.readyState === WebSocket.OPEN) oldWs.close();
+        if (oldWs && oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
+          oldWs.close();
+        }
       }
+
       myId = newId;
       peers.set(myId, ws);
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
+      // Отправляем накопленные события
       const events = getEvents(myId);
-      for (const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
-      const groupEvents = getGroupEvents(myId);
-      for (const ev of groupEvents) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
+      for (const ev of events) {
+        send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
+      }
       return;
     }
 
+    // Пинг
     if (data.type === 'ping') {
       if (myId) resetHeartbeat(myId);
       return;
     }
 
+    // Push-подписка
     if (data.type === 'register-push') {
       if (!myId) return;
       const { playerId } = data;
@@ -235,22 +247,254 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // Личные сообщения
+    // --- ГРУППЫ ---
+    if (data.type === 'create-group') {
+      if (!myId) return;
+      const { groupId, name, avatar, description, inviteCode, creator } = data;
+      if (getGroupByInvite(inviteCode) || getGroup(groupId)) {
+        send(ws, { type: 'error', msg: 'Группа с таким ID или кодом уже существует' });
+        return;
+      }
+      createGroup({
+        id: groupId,
+        name,
+        creator_id: creator,
+        invite_code: inviteCode,
+        avatar,
+        description,
+        members: [creator]
+      });
+      send(ws, { type: 'group-created', groupId });
+      return;
+    }
+
+    if (data.type === 'group-info') {
+      const group = getGroupByInvite(data.inviteCode);
+      if (!group) {
+        send(ws, { type: 'error', msg: 'Группа не найдена' });
+        return;
+      }
+      send(ws, {
+        type: 'group-info-reply',
+        group: {
+          groupId: group.id,
+          name: group.name,
+          avatar: group.avatar,
+          description: group.description
+        }
+      });
+      return;
+    }
+
+    if (data.type === 'join-group') {
+      if (!myId) return;
+      const group = getGroupByInvite(data.inviteCode);
+      if (!group) {
+        send(ws, { type: 'error', msg: 'Группа не найдена' });
+        return;
+      }
+      if (JSON.parse(group.members).length >= 20) {
+        send(ws, { type: 'error', msg: 'Группа переполнена (макс. 20)' });
+        return;
+      }
+      if (!addMember(group.id, data.peerId)) {
+        send(ws, { type: 'error', msg: 'Вы уже в группе' });
+        return;
+      }
+
+      const updatedGroup = getGroup(group.id);
+      // Подтверждение вступившему
+      send(ws, {
+        type: 'group-joined',
+        groupId: group.id,
+        name: group.name,
+        avatar: group.avatar,
+        description: group.description,
+        inviteCode: group.invite_code,
+        members: JSON.parse(updatedGroup.members)
+      });
+
+      // Уведомляем остальных участников
+      const members = JSON.parse(updatedGroup.members);
+      members.forEach(memberId => {
+        if (memberId === data.peerId) return;
+        const targetWs = peers.get(memberId);
+        const ev = {
+          type: 'group-updated',
+          groupId: group.id,
+          members: JSON.parse(updatedGroup.members)
+        };
+        if (targetWs) {
+          send(targetWs, ev);
+        } else {
+          enqueueEvent(memberId, 'group-updated', ev);
+        }
+      });
+      return;
+    }
+
+    if (data.type === 'group-update') {
+      if (!myId) return;
+      const group = getGroup(data.groupId);
+      if (!group || group.creator_id !== myId) return;
+      updateGroup(data.groupId, data.changes);
+
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(memberId => {
+        const targetWs = peers.get(memberId);
+        const ev = {
+          type: 'group-updated',
+          groupId: data.groupId,
+          changes: data.changes
+        };
+        if (targetWs) {
+          send(targetWs, ev);
+        } else {
+          enqueueEvent(memberId, 'group-updated', ev);
+        }
+      });
+      return;
+    }
+
+    if (data.type === 'group-remove-member') {
+      if (!myId) return;
+      const group = getGroup(data.groupId);
+      if (!group || group.creator_id !== myId) return;
+      if (data.targetPeerId === myId) return; // нельзя удалить себя
+      removeMember(data.groupId, data.targetPeerId);
+
+      const updated = getGroup(data.groupId);
+      // Удалённому
+      const removedWs = peers.get(data.targetPeerId);
+      if (removedWs) {
+        send(removedWs, {
+          type: 'group-member-removed',
+          groupId: data.groupId,
+          targetPeerId: data.targetPeerId
+        });
+      } else {
+        enqueueEvent(data.targetPeerId, 'group-member-removed', {
+          groupId: data.groupId,
+          targetPeerId: data.targetPeerId
+        });
+      }
+
+      // Остальным
+      const members = JSON.parse(updated.members);
+      members.forEach(memberId => {
+        if (memberId === data.targetPeerId) return;
+        const targetWs = peers.get(memberId);
+        const ev = {
+          type: 'group-updated',
+          groupId: data.groupId,
+          members: JSON.parse(updated.members)
+        };
+        if (targetWs) {
+          send(targetWs, ev);
+        } else {
+          enqueueEvent(memberId, 'group-updated', ev);
+        }
+      });
+      return;
+    }
+
+    if (data.type === 'group-leave') {
+      if (!myId) return;
+      const group = getGroup(data.groupId);
+      if (!group) return;
+      removeMember(data.groupId, data.peerId);
+
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(memberId => {
+        const targetWs = peers.get(memberId);
+        const ev = {
+          type: 'group-updated',
+          groupId: data.groupId,
+          members: JSON.parse(updated.members)
+        };
+        if (targetWs) {
+          send(targetWs, ev);
+        } else {
+          enqueueEvent(memberId, 'group-updated', ev);
+        }
+      });
+      return;
+    }
+
+    if (data.type === 'group-members') {
+      if (!myId) return;
+      const group = getGroup(data.groupId);
+      if (!group) return;
+      send(ws, {
+        type: 'group-members-reply',
+        groupId: data.groupId,
+        members: JSON.parse(group.members)
+      });
+      return;
+    }
+
+    if (data.type === 'group-read') {
+      if (!myId) return;
+      const group = getGroup(data.groupId);
+      if (!group) return;
+      JSON.parse(group.members).forEach(memberId => {
+        if (memberId === data.readerPeerId) return;
+        const targetWs = peers.get(memberId);
+        const ev = {
+          type: 'group-msg-read',
+          groupId: data.groupId,
+          msgId: data.msgId
+        };
+        if (targetWs) {
+          send(targetWs, ev);
+        } else {
+          enqueueEvent(memberId, 'group-msg-read', ev);
+        }
+      });
+      return;
+    }
+
+    // --- ОТПРАВКА СООБЩЕНИЙ (обычные и групповые) ---
     if (data.type === 'send-msg') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
       const { msgId, payload, ephemeral } = data;
       if (!target || !msgId || !payload) return;
+
+      // Если цель — группа (начинается с grp_)
+      if (target.startsWith('grp_')) {
+        const group = getGroup(target);
+        if (!group) return;
+        const members = JSON.parse(group.members);
+        members.forEach(memberId => {
+          if (memberId === myId) return; // себе не отправляем
+          const memberWs = peers.get(memberId);
+          if (memberWs) {
+            send(memberWs, { type: 'incoming-msg', from: myId, msgId, payload });
+          } else {
+            sendPushNotification(memberId, 'Новое сообщение в группе').catch(() => {});
+          }
+          if (!ephemeral) {
+            enqueueEvent(memberId, 'incoming-msg', { from: myId, msgId, payload });
+          }
+        });
+        return;
+      }
+
+      // Обычная личная отправка
       const targetWs = peers.get(target);
       if (targetWs) {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
       } else {
         sendPushNotification(target, 'Новое сообщение').catch(() => {});
       }
-      if (!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      if (!ephemeral) {
+        enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      }
       return;
     }
 
+    // Подтверждение получения сообщения
     if (data.type === 'ack-msg') {
       if (!myId) return;
       const { msgId } = data;
@@ -258,16 +502,20 @@ wss.on('connection', (ws, req) => {
       if (senderId) {
         const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
         const senderWs = peers.get(senderId);
-        if (senderWs) send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+        if (senderWs) {
+          send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+        }
       }
       return;
     }
 
+    // Подтверждение обработки события
     if (data.type === 'ack-event') {
       if (myId && data.eventId) deleteEvent(data.eventId);
       return;
     }
 
+    // Запрос присутствия
     if (data.type === 'query-presence') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -275,161 +523,27 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
+    // Голосовое прослушано
     if (data.type === 'voice-listened') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
-      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
-      const targetWs = peers.get(target);
-      if (targetWs) send(targetWs, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
-      return;
-    }
-
-    // Группы
-    if (data.type === 'create-group') {
-      if (!myId) return;
-      const { groupId, name, description, avatar } = data;
-      if (!groupId || !name) return;
-      try {
-        db.prepare(`INSERT INTO groups (group_id, name, description, avatar, creator_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
-          .run(groupId, name, description || '', avatar || '👥', myId, Date.now());
-        db.prepare(`INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'admin', ?)`)
-          .run(groupId, myId, Date.now());
-        send(ws, { type: 'group-created', groupId, name });
-      } catch (e) {
-        send(ws, { type: 'error', message: 'Group creation failed' });
-      }
-      return;
-    }
-
-    if (data.type === 'join-group') {
-      if (!myId) return;
-      const { groupId } = data;
-      if (!groupId) return;
-      const group = db.prepare(`SELECT * FROM groups WHERE group_id = ?`).get(groupId);
-      if (!group) { send(ws, { type: 'error', message: 'Group not found' }); return; }
-      const members = getGroupMembers(groupId);
-      if (members.length >= 20) { send(ws, { type: 'error', message: 'Group is full' }); return; }
-      if (members.find(m => m.user_id === myId)) { send(ws, { type: 'error', message: 'Already a member' }); return; }
-      db.prepare(`INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)`)
-        .run(groupId, myId, Date.now());
-      
-      // Отправляем подтверждение с реальным именем группы
-      send(ws, { type: 'group-joined', groupId, name: group.name, avatar: group.avatar });
-      
-      // Уведомляем других онлайн участников
-      for (const member of members) {
-        const memberWs = peers.get(member.user_id);
-        if (memberWs) send(memberWs, { type: 'group-member-joined', groupId, userId: myId });
-      }
-      return;
-    }
-
-    if (data.type === 'get-group-info') {
-      if (!myId) return;
-      const { groupId } = data;
-      if (!groupId) return;
-      const group = db.prepare(`SELECT * FROM groups WHERE group_id = ?`).get(groupId);
-      if (!group) { send(ws, { type: 'error', message: 'Group not found' }); return; }
-      const members = getGroupMembers(groupId);
-      send(ws, {
-        type: 'group-info',
-        groupId,
-        name: group.name,
-        description: group.description,
-        avatar: group.avatar,
-        members: members.map(m => ({ id: m.user_id, role: m.role }))
+      const eventId = enqueueEvent(target, 'voice-listened', {
+        from: myId,
+        voiceMsgId: data.voiceMsgId
       });
-      return;
-    }
-
-    if (data.type === 'send-group-msg') {
-      if (!myId) return;
-      const { groupId, msgId, payload } = data;
-      if (!groupId || !msgId || !payload) return;
-      if (!isGroupMember(groupId, myId)) { send(ws, { type: 'error', message: 'Not a member' }); return; }
-      saveGroupMessageInfo(msgId, groupId, myId);
-      const members = getGroupMembers(groupId);
-      const group = db.prepare(`SELECT name FROM groups WHERE group_id = ?`).get(groupId);
-      const groupName = group?.name || groupId;
-      for (const member of members) {
-        if (member.user_id === myId) continue;
-        const targetWs = peers.get(member.user_id);
-        const eventPayload = { groupId, from: myId, msgId, payload, groupName };
-        if (targetWs) {
-          send(targetWs, { type: 'group-msg', ...eventPayload });
-        } else {
-          enqueueGroupEvent(member.user_id, groupId, 'group-msg', eventPayload);
-          sendPushNotification(member.user_id, `👥 ${groupName}: новое сообщение`).catch(() => {});
-        }
+      const targetWs = peers.get(target);
+      if (targetWs) {
+        send(targetWs, {
+          type: 'voice-listened',
+          from: myId,
+          voiceMsgId: data.voiceMsgId,
+          eventId
+        });
       }
       return;
     }
 
-    if (data.type === 'ack-group-msg') {
-      if (!myId) return;
-      const { groupId, msgId } = data;
-      const row = db.prepare(`
-        SELECT id FROM group_events 
-        WHERE recipient_id = ? AND type = 'group-msg' AND json_extract(payload, '$.msgId') = ?
-      `).get(myId, msgId);
-      if (row) db.prepare(`DELETE FROM group_events WHERE id = ?`).run(row.id);
-      return;
-    }
-
-    if (data.type === 'mark-group-read') {
-      if (!myId) return;
-      const { groupId } = data;
-      if (!groupId || !isGroupMember(groupId, myId)) return;
-      markGroupMessagesRead(groupId, myId);
-      return;
-    }
-
-    if (data.type === 'leave-group') {
-      if (!myId) return;
-      const { groupId } = data;
-      if (!groupId) return;
-      db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).run(groupId, myId);
-      deleteAllGroupEventsForUserInGroup(myId, groupId);
-      const remaining = getGroupMembers(groupId);
-      if (remaining.length === 0) {
-        db.prepare(`DELETE FROM groups WHERE group_id = ?`).run(groupId);
-        db.prepare(`DELETE FROM group_messages WHERE group_id = ?`).run(groupId);
-        db.prepare(`DELETE FROM group_events WHERE group_id = ?`).run(groupId);
-      } else {
-        const wasAdmin = db.prepare(`SELECT role FROM group_members WHERE group_id = ? AND user_id = ?`).get(groupId, myId);
-        if (wasAdmin?.role === 'admin') {
-          const newAdmin = remaining[0];
-          db.prepare(`UPDATE group_members SET role = 'admin' WHERE group_id = ? AND user_id = ?`).run(groupId, newAdmin.user_id);
-        }
-        for (const member of remaining) {
-          const memberWs = peers.get(member.user_id);
-          if (memberWs) send(memberWs, { type: 'group-member-left', groupId, userId: myId });
-        }
-      }
-      send(ws, { type: 'group-left', groupId });
-      return;
-    }
-
-    if (data.type === 'remove-member') {
-      if (!myId) return;
-      const { groupId, userId } = data;
-      if (!groupId || !userId) return;
-      const memberRow = db.prepare(`SELECT role FROM group_members WHERE group_id = ? AND user_id = ?`).get(groupId, myId);
-      if (!memberRow || memberRow.role !== 'admin') { send(ws, { type: 'error', message: 'Not admin' }); return; }
-      if (userId === myId) { send(ws, { type: 'error', message: 'Cannot remove yourself' }); return; }
-      db.prepare(`DELETE FROM group_members WHERE group_id = ? AND user_id = ?`).run(groupId, userId);
-      deleteAllGroupEventsForUserInGroup(userId, groupId);
-      const targetWs = peers.get(userId);
-      if (targetWs) send(targetWs, { type: 'group-kicked', groupId });
-      const remaining = getGroupMembers(groupId);
-      for (const member of remaining) {
-        const memberWs = peers.get(member.user_id);
-        if (memberWs) send(memberWs, { type: 'group-member-removed', groupId, userId });
-      }
-      send(ws, { type: 'member-removed', groupId, userId });
-      return;
-    }
-
+    // Произвольный сигнал (если нужен)
     if (data.type === 'signal' && data.target) {
       const targetWs = peers.get(data.target.toLowerCase());
       if (targetWs) send(targetWs, { type: 'signal', from: myId, payload: data.payload });
@@ -448,10 +562,14 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Самопинг
+// --- САМОПИНГ каждые 4 минуты ---
 const APP_URL = 'https://onrender.com';
 setInterval(() => {
-  https.get(APP_URL, (res) => console.log(`[Self-Ping] Status: ${res.statusCode}`)).on('error', (err) => console.error(`[Self-Ping] Error: ${err.message}`));
-}, 4 * 60 * 1000);
+  https.get(APP_URL, (res) => {
+    console.log(`[Self-Ping] Status: ${res.statusCode} - Keep-alive active`);
+  }).on('error', (err) => {
+    console.error(`[Self-Ping] Error: ${err.message}`);
+  });
+}, 4 * 60 * 1000); // 4 минуты
 
-console.log(`[server] Groups ready on port ${PORT}`);
+console.log(`[server] SQLite + WebSocket + Groups ready on port ${PORT}`);
