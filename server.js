@@ -2,7 +2,7 @@ const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
+const https = require('https'); // для самопинга
 
 // --- БД SQLite с WAL-режимом ---
 const dbPath = path.join(__dirname, 'offline_queue.db');
@@ -18,24 +18,6 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
-`);
-
-// Таблица для чанков больших файлов
-db.exec(`
-  CREATE TABLE IF NOT EXISTS file_chunks (
-    transfer_id TEXT NOT NULL,
-    chunk_index INTEGER NOT NULL,
-    total_chunks INTEGER NOT NULL,
-    sender_id TEXT NOT NULL,
-    recipient_id TEXT NOT NULL,
-    file_name TEXT,
-    file_type TEXT,
-    file_size INTEGER,
-    chunk_data TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (transfer_id, chunk_index)
-  );
-  CREATE INDEX IF NOT EXISTS idx_chunks_transfer ON file_chunks (transfer_id);
 `);
 
 // Таблица групп
@@ -84,7 +66,13 @@ async function sendPushNotification(userId, message) {
 }
 
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+
+// Увеличиваем лимит входящего сообщения для передачи больших файлов (до 100 МБ)
+const wss = new WebSocket.Server({
+  port: PORT,
+  maxPayload: 100 * 1024 * 1024
+});
+
 const peers = new Map();
 
 // Heartbeat
@@ -208,66 +196,6 @@ function removeMember(groupId, peerId) {
     JSON.stringify(members),
     groupId
   );
-}
-
-// --- Работа с чанками ---
-function saveChunk(transferId, chunkIndex, totalChunks, senderId, recipientId, fileName, fileType, fileSize, chunkData) {
-  const stmt = db.prepare(
-    `INSERT OR REPLACE INTO file_chunks (transfer_id, chunk_index, total_chunks, sender_id, recipient_id, file_name, file_type, file_size, chunk_data, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  stmt.run(transferId, chunkIndex, totalChunks, senderId, recipientId, fileName, fileType, fileSize, chunkData, Date.now());
-}
-
-function checkTransferComplete(transferId, totalChunks) {
-  const count = db.prepare(`SELECT COUNT(*) as cnt FROM file_chunks WHERE transfer_id = ?`).get(transferId).cnt;
-  return count >= totalChunks;
-}
-
-function assembleAndClearChunks(transferId) {
-  const rows = db.prepare(`SELECT * FROM file_chunks WHERE transfer_id = ? ORDER BY chunk_index`).all(transferId);
-  if (!rows.length) return null;
-  const assembled = {
-    fileName: rows[0].file_name,
-    fileType: rows[0].file_type,
-    fileSize: rows[0].file_size,
-    data: rows.map(r => {
-      // Извлекаем только base64-контент из Data URL чанка
-      const spl = r.chunk_data.split(',');
-      return spl[1] || '';
-    }).join('')
-  };
-  // Оборачиваем обратно в Data URL
-  assembled.data = `data:${assembled.fileType};base64,${assembled.data}`;
-  db.prepare(`DELETE FROM file_chunks WHERE transfer_id = ?`).run(transferId);
-  return assembled;
-}
-
-function deliverAssembledFile(recipientId, filePayload, senderId, transferId) {
-  // Отправляем как обычное входящее сообщение с типом 'file' и собранными данными
-  const msgId = 'file_' + transferId;
-  const payloadObj = {
-    type: 'file',
-    id: msgId,
-    text: '',
-    ts: Date.now(),
-    replyTo: null,
-    forwarded: false,
-    file: {
-      name: filePayload.fileName,
-      type: filePayload.fileType,
-      data: filePayload.data,
-      size: filePayload.fileSize
-    }
-  };
-  const payload = JSON.stringify(payloadObj);
-  const targetWs = peers.get(recipientId);
-  if (targetWs) {
-    send(targetWs, { type: 'incoming-msg', from: senderId, msgId, payload: payload });
-  } else {
-    sendPushNotification(recipientId, '📁 Файл получен').catch(() => {});
-  }
-  enqueueEvent(recipientId, 'incoming-msg', { from: senderId, msgId, payload: payload });
 }
 
 wss.on('connection', (ws, req) => {
@@ -532,62 +460,43 @@ wss.on('connection', (ws, req) => {
       return;
     }
 
-    // --- Передача файлов чанками ---
-    if (data.type === 'transfer-start') {
-      if (!myId) return;
-      const { transferId, totalChunks, fileName, fileType, fileSize, target } = data;
-      if (totalChunks > 5000) { send(ws, { type: 'error', msg: 'Слишком много чанков' }); return; }
-      send(ws, { type: 'transfer-accepted', transferId });
-      return;
-    }
-
-    if (data.type === 'chunk-data') {
-      if (!myId) return;
-      const { transferId, chunkIndex, totalChunks, fileName, fileType, fileSize, target, chunkData } = data;
-      if (!transferId || chunkIndex === undefined) return;
-      saveChunk(transferId, chunkIndex, totalChunks, myId, target, fileName, fileType, fileSize, chunkData);
-      const complete = checkTransferComplete(transferId, totalChunks);
-      if (complete) {
-        const assembled = assembleAndClearChunks(transferId);
-        if (assembled) {
-          deliverAssembledFile(target, assembled, myId, transferId);
-        }
-      }
-      return;
-    }
-
-    if (data.type === 'transfer-cancel') {
-      if (!myId) return;
-      const { transferId } = data;
-      db.prepare(`DELETE FROM file_chunks WHERE transfer_id = ? AND sender_id = ?`).run(transferId, myId);
-      return;
-    }
-
-    // --- Обычные сообщения ---
+    // --- ОТПРАВКА СООБЩЕНИЙ (обычные и групповые) ---
     if (data.type === 'send-msg') {
       if (!myId) return;
       const target = (data.target || '').toLowerCase();
       const { msgId, payload, ephemeral } = data;
       if (!target || !msgId || !payload) return;
 
+      // Если цель — группа (начинается с grp_)
       if (target.startsWith('grp_')) {
         const group = getGroup(target);
         if (!group) return;
         const members = JSON.parse(group.members);
         members.forEach(memberId => {
-          if (memberId === myId) return;
+          if (memberId === myId) return; // себе не отправляем
           const memberWs = peers.get(memberId);
-          if (memberWs) send(memberWs, { type: 'incoming-msg', from: myId, msgId, payload });
-          else sendPushNotification(memberId, 'Новое сообщение в группе').catch(() => {});
-          if (!ephemeral) enqueueEvent(memberId, 'incoming-msg', { from: myId, msgId, payload });
+          if (memberWs) {
+            send(memberWs, { type: 'incoming-msg', from: myId, msgId, payload });
+          } else {
+            sendPushNotification(memberId, 'Новое сообщение в группе').catch(() => {});
+          }
+          if (!ephemeral) {
+            enqueueEvent(memberId, 'incoming-msg', { from: myId, msgId, payload });
+          }
         });
         return;
       }
 
+      // Обычная личная отправка
       const targetWs = peers.get(target);
-      if (targetWs) send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-      else sendPushNotification(target, 'Новое сообщение').catch(() => {});
-      if (!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      if (targetWs) {
+        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
+      } else {
+        sendPushNotification(target, 'Новое сообщение').catch(() => {});
+      }
+      if (!ephemeral) {
+        enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      }
       return;
     }
 
@@ -669,4 +578,4 @@ setInterval(() => {
   });
 }, 4 * 60 * 1000); // 4 минуты
 
-console.log(`[server] SQLite + WebSocket + Chunked file transfer ready on port ${PORT}`);
+console.log(`[server] SQLite + WebSocket + Groups ready on port ${PORT}`);
