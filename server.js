@@ -2,59 +2,67 @@ const WebSocket = require('ws');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const https = require('https'); // для самопинга
+const https = require('https');
 
-// --- БД SQLite с WAL-режимом ---
+// ─── SQLite WAL ───────────────────────────────────────────────────────────────
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
+db.pragma('synchronous = NORMAL');   // быстрее чем FULL, безопасно при WAL
+db.pragma('cache_size = -8000');     // 8 МБ кэш
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
     recipient_id TEXT NOT NULL,
-    type TEXT NOT NULL,
-    payload TEXT NOT NULL,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
-`);
 
-// Таблица групп
-db.exec(`
   CREATE TABLE IF NOT EXISTS groups (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    creator_id TEXT NOT NULL,
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    creator_id  TEXT NOT NULL,
     invite_code TEXT UNIQUE NOT NULL,
-    avatar TEXT DEFAULT '👥',
+    avatar      TEXT DEFAULT '👥',
     description TEXT DEFAULT '',
-    members TEXT DEFAULT '[]',
-    created_at INTEGER NOT NULL
+    members     TEXT DEFAULT '[]',
+    created_at  INTEGER NOT NULL
   );
 `);
 
-// --- Push-подписки ---
-const pushSubscriptionsFile = path.join(__dirname, 'push_subscriptions.json');
-let pushSubscriptions = {};
-try {
-  if (fs.existsSync(pushSubscriptionsFile))
-    pushSubscriptions = JSON.parse(fs.readFileSync(pushSubscriptionsFile, 'utf8'));
-} catch (e) {}
+// ─── Подготовленные запросы (быстрее повторных парсингов) ─────────────────────
+const stmtInsertEvent  = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
+const stmtGetEvents    = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
+const stmtDeleteEvent  = db.prepare(`DELETE FROM events WHERE id=?`);
+const stmtAckMsg       = db.prepare(`
+  SELECT id, json_extract(payload,'$.from') AS sender
+  FROM events
+  WHERE recipient_id=? AND type='incoming-msg' AND json_extract(payload,'$.msgId')=?
+  LIMIT 1
+`);
+const stmtDeleteById   = db.prepare(`DELETE FROM events WHERE id=?`);
+
+// Batch-удаление событий (для быстрой очистки файловых чанков)
+const stmtDeleteByRecipientType = db.prepare(`DELETE FROM events WHERE recipient_id=? AND type=?`);
+
+// ─── Push ─────────────────────────────────────────────────────────────────────
+const pushFile = path.join(__dirname, 'push_subscriptions.json');
+let pushSubs = {};
+try { if(fs.existsSync(pushFile)) pushSubs = JSON.parse(fs.readFileSync(pushFile, 'utf8')); } catch(e) {}
 
 const ONESIGNAL_APP_ID = 'c5b0ecd0-3e67-47a0-823d-771a7c4de3be';
-const ONESIGNAL_REST_API_KEY = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
+const ONESIGNAL_KEY    = 'os_v2_app_ywyozub6m5d2bar5o4nhytpdxzr72sz2khuemruxqbapncfalaxcwfqlqoxvcenyxr6sa5uvelsbqwpwrwihgdpwn4ectomaup5byuq';
 
-async function sendPushNotification(userId, message) {
-  const playerId = pushSubscriptions[userId];
-  if (!playerId) return;
+async function sendPush(userId, message) {
+  const playerId = pushSubs[userId];
+  if(!playerId) return;
   try {
-    await fetch('https://onesignal.com', {
+    await fetch('https://api.onesignal.com/notifications', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Basic ${ONESIGNAL_REST_API_KEY}`
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Basic ${ONESIGNAL_KEY}` },
       body: JSON.stringify({
         app_id: ONESIGNAL_APP_ID,
         include_player_ids: [playerId],
@@ -62,165 +70,90 @@ async function sendPushNotification(userId, message) {
         headings: { en: 'K-Chat' }
       })
     });
-  } catch (e) {}
+  } catch(e) {}
 }
 
+// ─── WebSocket сервер ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-
-// Увеличиваем лимит входящего сообщения для передачи больших файлов (до 100 МБ)
 const wss = new WebSocket.Server({
   port: PORT,
-  maxPayload: 100 * 1024 * 1024
+  maxPayload: 256 * 1024 * 1024   // 256 МБ — на случай очень больших чанков
 });
 
-const peers = new Map();
-
-// Heartbeat
-const HEARTBEAT_TIMEOUT = 60000;
+const peers = new Map();           // peerId → WebSocket
 const heartbeats = new Map();
+const HEARTBEAT_TIMEOUT = 60_000;
 
+// ─── Хелперы ─────────────────────────────────────────────────────────────────
 function send(ws, obj) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
 function broadcastPresence(peerId, isOnline) {
   const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
-  for (const [, ws] of peers) if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  for(const [, ws] of peers) if(ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
 
 function resetHeartbeat(peerId) {
-  if (heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
-  const timeout = setTimeout(() => {
-    console.log(`[${peerId}] heartbeat timeout, forcing offline`);
-    if (peers.has(peerId)) peers.get(peerId).close();
-  }, HEARTBEAT_TIMEOUT);
-  heartbeats.set(peerId, timeout);
+  if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
+  heartbeats.set(peerId, setTimeout(() => {
+    console.log(`[${peerId}] heartbeat timeout`);
+    peers.get(peerId)?.close();
+  }, HEARTBEAT_TIMEOUT));
 }
 
 function enqueueEvent(recipientId, type, payload) {
-  const stmt = db.prepare(
-    `INSERT INTO events (recipient_id, type, payload, created_at) VALUES (?, ?, ?, ?)`
-  );
-  const info = stmt.run(recipientId, type, JSON.stringify(payload), Date.now());
+  const info = stmtInsertEvent.run(recipientId, type, JSON.stringify(payload), Date.now());
   return info.lastInsertRowid;
 }
 
 function getEvents(recipientId) {
-  return db
-    .prepare(`SELECT * FROM events WHERE recipient_id = ? ORDER BY created_at`)
-    .all(recipientId)
-    .map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
+  return stmtGetEvents.all(recipientId).map(r => ({
+    id: r.id, type: r.type, payload: JSON.parse(r.payload)
+  }));
 }
 
-function deleteEvent(eventId) {
-  db.prepare(`DELETE FROM events WHERE id = ?`).run(eventId);
-}
+// ─── Группы ──────────────────────────────────────────────────────────────────
+const stmtGetGroup        = db.prepare('SELECT * FROM groups WHERE id=?');
+const stmtGetGroupInvite  = db.prepare('SELECT * FROM groups WHERE invite_code=?');
+const stmtCreateGroup     = db.prepare('INSERT INTO groups (id,name,creator_id,invite_code,avatar,description,members,created_at) VALUES (?,?,?,?,?,?,?,?)');
+const stmtUpdateGroupMbrs = db.prepare('UPDATE groups SET members=? WHERE id=?');
+const stmtUpdateGroup     = db.prepare('UPDATE groups SET name=?,avatar=?,description=?,members=? WHERE id=?');
 
-function ackIncomingMsg(recipientId, msgId) {
-  const row = db
-    .prepare(
-      `SELECT id, json_extract(payload, '$.from') as sender
-       FROM events
-       WHERE recipient_id = ? AND type = 'incoming-msg'
-         AND json_extract(payload, '$.msgId') = ?
-       LIMIT 1`
-    )
-    .get(recipientId, msgId);
-
-  if (!row) return null;
-  db.prepare(`DELETE FROM events WHERE id = ?`).run(row.id);
-  return row.sender;
-}
-
-// Работа с группами
-function getGroup(groupId) {
-  return db.prepare('SELECT * FROM groups WHERE id = ?').get(groupId);
-}
-
-function getGroupByInvite(code) {
-  return db.prepare('SELECT * FROM groups WHERE invite_code = ?').get(code);
-}
-
-function createGroup(group) {
-  const stmt = db.prepare(
-    'INSERT INTO groups (id, name, creator_id, invite_code, avatar, description, members, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-  );
-  stmt.run(
-    group.id,
-    group.name,
-    group.creator_id,
-    group.invite_code,
-    group.avatar || '👥',
-    group.description || '',
-    JSON.stringify(group.members || []),
-    Date.now()
-  );
-}
-
-function updateGroup(groupId, changes) {
-  const group = getGroup(groupId);
-  if (!group) return;
-  const newMembers = changes.members
-    ? JSON.stringify(changes.members)
-    : group.members;
-  db.prepare(
-    'UPDATE groups SET name = ?, avatar = ?, description = ?, members = ? WHERE id = ?'
-  ).run(
-    changes.name || group.name,
-    changes.avatar || group.avatar,
-    changes.description || group.description,
-    newMembers,
-    groupId
-  );
-}
+const getGroup       = id   => stmtGetGroup.get(id);
+const getGroupInvite = code => stmtGetGroupInvite.get(code);
 
 function addMember(groupId, peerId) {
-  const group = getGroup(groupId);
-  if (!group) return false;
-  const members = JSON.parse(group.members);
-  if (members.includes(peerId)) return false;
-  if (members.length >= 20) return false; // лимит
+  const g = getGroup(groupId); if(!g) return false;
+  const members = JSON.parse(g.members);
+  if(members.includes(peerId) || members.length >= 20) return false;
   members.push(peerId);
-  db.prepare('UPDATE groups SET members = ? WHERE id = ?').run(
-    JSON.stringify(members),
-    groupId
-  );
+  stmtUpdateGroupMbrs.run(JSON.stringify(members), groupId);
   return true;
 }
 
 function removeMember(groupId, peerId) {
-  const group = getGroup(groupId);
-  if (!group) return;
-  const members = JSON.parse(group.members).filter(id => id !== peerId);
-  db.prepare('UPDATE groups SET members = ? WHERE id = ?').run(
-    JSON.stringify(members),
-    groupId
-  );
+  const g = getGroup(groupId); if(!g) return;
+  const members = JSON.parse(g.members).filter(id => id !== peerId);
+  stmtUpdateGroupMbrs.run(JSON.stringify(members), groupId);
 }
 
-wss.on('connection', (ws, req) => {
+// ─── Соединения ──────────────────────────────────────────────────────────────
+wss.on('connection', (ws) => {
   let myId = null;
-
-  if (req.headers.upgrade !== 'websocket') {
-    ws.terminate();
-    return;
-  }
 
   ws.on('message', (raw) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // Регистрация
-    if (data.type === 'register') {
-      const newId = (data.peerId || '').toLowerCase();
-      if (!newId) return;
+    // ── Регистрация ──────────────────────────────────────────────────────────
+    if(data.type === 'register') {
+      const newId = (data.peerId || '').toLowerCase().trim();
+      if(!newId) return;
 
-      if (peers.has(newId)) {
-        const oldWs = peers.get(newId);
-        if (oldWs && oldWs !== ws && oldWs.readyState === WebSocket.OPEN) {
-          oldWs.close();
-        }
-      }
+      // Закрываем старое соединение если есть
+      const old = peers.get(newId);
+      if(old && old !== ws && old.readyState === WebSocket.OPEN) old.close();
 
       myId = newId;
       peers.set(myId, ws);
@@ -228,354 +161,240 @@ wss.on('connection', (ws, req) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Отправляем накопленные события
+      // Доставляем накопленную очередь
       const events = getEvents(myId);
-      for (const ev of events) {
-        send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
-      }
+      for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
       return;
     }
 
-    // Пинг
-    if (data.type === 'ping') {
-      if (myId) resetHeartbeat(myId);
+    // ── Ping ─────────────────────────────────────────────────────────────────
+    if(data.type === 'ping') {
+      if(myId) resetHeartbeat(myId);
       return;
     }
 
-    // Push-подписка
-    if (data.type === 'register-push') {
-      if (!myId) return;
-      const { playerId } = data;
-      if (playerId) {
-        pushSubscriptions[myId] = playerId;
-        fs.writeFileSync(pushSubscriptionsFile, JSON.stringify(pushSubscriptions));
-      }
+    // ── Push-подписка ────────────────────────────────────────────────────────
+    if(data.type === 'register-push') {
+      if(!myId || !data.playerId) return;
+      pushSubs[myId] = data.playerId;
+      fs.writeFileSync(pushFile, JSON.stringify(pushSubs));
       return;
     }
 
-    // --- ГРУППЫ ---
-    if (data.type === 'create-group') {
-      if (!myId) return;
-      const { groupId, name, avatar, description, inviteCode, creator } = data;
-      if (getGroupByInvite(inviteCode) || getGroup(groupId)) {
-        send(ws, { type: 'error', msg: 'Группа с таким ID или кодом уже существует' });
-        return;
+    // ── Создание группы ──────────────────────────────────────────────────────
+    if(data.type === 'create-group') {
+      if(!myId) return;
+      if(getGroupInvite(data.inviteCode) || getGroup(data.groupId)) {
+        send(ws, { type: 'error', msg: 'Группа уже существует' }); return;
       }
-      createGroup({
-        id: groupId,
-        name,
-        creator_id: creator,
-        invite_code: inviteCode,
-        avatar,
-        description,
-        members: [creator]
-      });
-      send(ws, { type: 'group-created', groupId });
+      stmtCreateGroup.run(data.groupId, data.name, data.creator, data.inviteCode,
+        data.avatar||'👥', data.description||'', JSON.stringify([data.creator]), Date.now());
+      send(ws, { type: 'group-created', groupId: data.groupId });
       return;
     }
 
-    if (data.type === 'group-info') {
-      const group = getGroupByInvite(data.inviteCode);
-      if (!group) {
-        send(ws, { type: 'error', msg: 'Группа не найдена' });
-        return;
-      }
-      send(ws, {
-        type: 'group-info-reply',
-        group: {
-          groupId: group.id,
-          name: group.name,
-          avatar: group.avatar,
-          description: group.description
-        }
-      });
+    if(data.type === 'group-info') {
+      const g = getGroupInvite(data.inviteCode);
+      if(!g) { send(ws, { type: 'error', msg: 'Группа не найдена' }); return; }
+      send(ws, { type: 'group-info-reply', group: { groupId: g.id, name: g.name, avatar: g.avatar, description: g.description } });
       return;
     }
 
-    if (data.type === 'join-group') {
-      if (!myId) return;
-      const group = getGroupByInvite(data.inviteCode);
-      if (!group) {
-        send(ws, { type: 'error', msg: 'Группа не найдена' });
-        return;
-      }
-      if (JSON.parse(group.members).length >= 20) {
-        send(ws, { type: 'error', msg: 'Группа переполнена (макс. 20)' });
-        return;
-      }
-      if (!addMember(group.id, data.peerId)) {
-        send(ws, { type: 'error', msg: 'Вы уже в группе' });
-        return;
-      }
-
-      const updatedGroup = getGroup(group.id);
-      // Подтверждение вступившему
-      send(ws, {
-        type: 'group-joined',
-        groupId: group.id,
-        name: group.name,
-        avatar: group.avatar,
-        description: group.description,
-        inviteCode: group.invite_code,
-        members: JSON.parse(updatedGroup.members)
-      });
-
-      // Уведомляем остальных участников
-      const members = JSON.parse(updatedGroup.members);
-      members.forEach(memberId => {
-        if (memberId === data.peerId) return;
-        const targetWs = peers.get(memberId);
-        const ev = {
-          type: 'group-updated',
-          groupId: group.id,
-          members: JSON.parse(updatedGroup.members)
-        };
-        if (targetWs) {
-          send(targetWs, ev);
-        } else {
-          enqueueEvent(memberId, 'group-updated', ev);
-        }
-      });
-      return;
-    }
-
-    if (data.type === 'group-update') {
-      if (!myId) return;
-      const group = getGroup(data.groupId);
-      if (!group || group.creator_id !== myId) return;
-      updateGroup(data.groupId, data.changes);
-
-      const updated = getGroup(data.groupId);
-      JSON.parse(updated.members).forEach(memberId => {
-        const targetWs = peers.get(memberId);
-        const ev = {
-          type: 'group-updated',
-          groupId: data.groupId,
-          changes: data.changes
-        };
-        if (targetWs) {
-          send(targetWs, ev);
-        } else {
-          enqueueEvent(memberId, 'group-updated', ev);
-        }
-      });
-      return;
-    }
-
-    if (data.type === 'group-remove-member') {
-      if (!myId) return;
-      const group = getGroup(data.groupId);
-      if (!group || group.creator_id !== myId) return;
-      if (data.targetPeerId === myId) return; // нельзя удалить себя
-      removeMember(data.groupId, data.targetPeerId);
-
-      const updated = getGroup(data.groupId);
-      // Удалённому
-      const removedWs = peers.get(data.targetPeerId);
-      if (removedWs) {
-        send(removedWs, {
-          type: 'group-member-removed',
-          groupId: data.groupId,
-          targetPeerId: data.targetPeerId
-        });
-      } else {
-        enqueueEvent(data.targetPeerId, 'group-member-removed', {
-          groupId: data.groupId,
-          targetPeerId: data.targetPeerId
-        });
-      }
-
-      // Остальным
+    if(data.type === 'join-group') {
+      if(!myId) return;
+      const g = getGroupInvite(data.inviteCode);
+      if(!g) { send(ws, { type: 'error', msg: 'Группа не найдена' }); return; }
+      if(JSON.parse(g.members).length >= 20) { send(ws, { type: 'error', msg: 'Группа переполнена' }); return; }
+      if(!addMember(g.id, data.peerId)) { send(ws, { type: 'error', msg: 'Вы уже в группе' }); return; }
+      const updated = getGroup(g.id);
       const members = JSON.parse(updated.members);
-      members.forEach(memberId => {
-        if (memberId === data.targetPeerId) return;
-        const targetWs = peers.get(memberId);
-        const ev = {
-          type: 'group-updated',
-          groupId: data.groupId,
-          members: JSON.parse(updated.members)
-        };
-        if (targetWs) {
-          send(targetWs, ev);
-        } else {
-          enqueueEvent(memberId, 'group-updated', ev);
-        }
+      send(ws, { type: 'group-joined', groupId: g.id, name: g.name, avatar: g.avatar,
+        description: g.description, inviteCode: g.invite_code, members });
+      members.forEach(mid => {
+        if(mid === data.peerId) return;
+        const ev = { type: 'group-updated', groupId: g.id, members };
+        const tw = peers.get(mid);
+        if(tw) send(tw, ev); else enqueueEvent(mid, 'group-updated', ev);
       });
       return;
     }
 
-    if (data.type === 'group-leave') {
-      if (!myId) return;
-      const group = getGroup(data.groupId);
-      if (!group) return;
-      removeMember(data.groupId, data.peerId);
-
+    if(data.type === 'group-update') {
+      if(!myId) return;
+      const g = getGroup(data.groupId);
+      if(!g || g.creator_id !== myId) return;
+      stmtUpdateGroup.run(data.changes.name||g.name, data.changes.avatar||g.avatar,
+        data.changes.description||g.description,
+        data.changes.members ? JSON.stringify(data.changes.members) : g.members, data.groupId);
       const updated = getGroup(data.groupId);
-      JSON.parse(updated.members).forEach(memberId => {
-        const targetWs = peers.get(memberId);
-        const ev = {
-          type: 'group-updated',
-          groupId: data.groupId,
-          members: JSON.parse(updated.members)
-        };
-        if (targetWs) {
-          send(targetWs, ev);
-        } else {
-          enqueueEvent(memberId, 'group-updated', ev);
-        }
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, changes: data.changes };
+        const tw = peers.get(mid);
+        if(tw) send(tw, ev); else enqueueEvent(mid, 'group-updated', ev);
       });
       return;
     }
 
-    if (data.type === 'group-members') {
-      if (!myId) return;
-      const group = getGroup(data.groupId);
-      if (!group) return;
-      send(ws, {
-        type: 'group-members-reply',
-        groupId: data.groupId,
-        members: JSON.parse(group.members)
+    if(data.type === 'group-remove-member') {
+      if(!myId) return;
+      const g = getGroup(data.groupId);
+      if(!g || g.creator_id !== myId || data.targetPeerId === myId) return;
+      removeMember(data.groupId, data.targetPeerId);
+      const updated = getGroup(data.groupId);
+      const tw = peers.get(data.targetPeerId);
+      const removedEv = { type: 'group-member-removed', groupId: data.groupId, targetPeerId: data.targetPeerId };
+      if(tw) send(tw, removedEv); else enqueueEvent(data.targetPeerId, 'group-member-removed', removedEv);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, members: JSON.parse(updated.members) };
+        const mw = peers.get(mid);
+        if(mw) send(mw, ev); else enqueueEvent(mid, 'group-updated', ev);
       });
       return;
     }
 
-    if (data.type === 'group-read') {
-      if (!myId) return;
-      const group = getGroup(data.groupId);
-      if (!group) return;
-      JSON.parse(group.members).forEach(memberId => {
-        if (memberId === data.readerPeerId) return;
-        const targetWs = peers.get(memberId);
-        const ev = {
-          type: 'group-msg-read',
-          groupId: data.groupId,
-          msgId: data.msgId
-        };
-        if (targetWs) {
-          send(targetWs, ev);
-        } else {
-          enqueueEvent(memberId, 'group-msg-read', ev);
-        }
+    if(data.type === 'group-leave') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      removeMember(data.groupId, data.peerId);
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, members: JSON.parse(updated.members) };
+        const mw = peers.get(mid);
+        if(mw) send(mw, ev); else enqueueEvent(mid, 'group-updated', ev);
       });
       return;
     }
 
-    // --- ОТПРАВКА СООБЩЕНИЙ (обычные и групповые) ---
-    if (data.type === 'send-msg') {
-      if (!myId) return;
+    if(data.type === 'group-members') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      send(ws, { type: 'group-members-reply', groupId: data.groupId, members: JSON.parse(g.members) });
+      return;
+    }
+
+    if(data.type === 'group-read') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      JSON.parse(g.members).forEach(mid => {
+        if(mid === data.readerPeerId) return;
+        const ev = { type: 'group-msg-read', groupId: data.groupId, msgId: data.msgId };
+        const mw = peers.get(mid);
+        if(mw) send(mw, ev); else enqueueEvent(mid, 'group-msg-read', ev);
+      });
+      return;
+    }
+
+    // ── Отправка сообщений ───────────────────────────────────────────────────
+    if(data.type === 'send-msg') {
+      if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const { msgId, payload, ephemeral } = data;
-      if (!target || !msgId || !payload) return;
+      const { msgId, payload, ephemeral, isChunk } = data;
+      if(!target || !msgId || !payload) return;
 
-      // Если цель — группа (начинается с grp_)
-      if (target.startsWith('grp_')) {
-        const group = getGroup(target);
-        if (!group) return;
-        const members = JSON.parse(group.members);
-        members.forEach(memberId => {
-          if (memberId === myId) return; // себе не отправляем
-          const memberWs = peers.get(memberId);
-          if (memberWs) {
-            send(memberWs, { type: 'incoming-msg', from: myId, msgId, payload });
+      // Групповая отправка
+      if(target.startsWith('grp_')) {
+        const g = getGroup(target); if(!g) return;
+        JSON.parse(g.members).forEach(mid => {
+          if(mid === myId) return;
+          const mw = peers.get(mid);
+          if(mw) {
+            send(mw, { type: 'incoming-msg', from: myId, msgId, payload });
           } else {
-            sendPushNotification(memberId, 'Новое сообщение в группе').catch(() => {});
+            sendPush(mid, 'Новое сообщение в группе').catch(() => {});
           }
-          if (!ephemeral) {
-            enqueueEvent(memberId, 'incoming-msg', { from: myId, msgId, payload });
-          }
+          if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
         });
         return;
       }
 
-      // Обычная личная отправка
+      // Личная отправка
       const targetWs = peers.get(target);
-      if (targetWs) {
+      if(targetWs) {
+        // Получатель онлайн — доставляем напрямую, мгновенно
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-      } else {
-        sendPushNotification(target, 'Новое сообщение').catch(() => {});
-      }
-      if (!ephemeral) {
-        enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
-      }
-      return;
-    }
-
-    // Подтверждение получения сообщения
-    if (data.type === 'ack-msg') {
-      if (!myId) return;
-      const { msgId } = data;
-      const senderId = ackIncomingMsg(myId, msgId);
-      if (senderId) {
-        const eventId = enqueueEvent(senderId, 'msg-delivered', { msgId, by: myId });
-        const senderWs = peers.get(senderId);
-        if (senderWs) {
-          send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+        // КЛЮЧЕВАЯ ОПТИМИЗАЦИЯ: файловые чанки НЕ сохраняем в SQLite если получатель онлайн
+        // Это убирает bottleneck записи на диск для каждого чанка (20+ записей для 5МБ файла)
+        if(!ephemeral && !isChunk) {
+          enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
+      } else {
+        // Получатель офлайн — сохраняем всё в очередь
+        if(!ephemeral) {
+          enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+        }
+        sendPush(target, 'Новое сообщение').catch(() => {});
       }
       return;
     }
 
-    // Подтверждение обработки события
-    if (data.type === 'ack-event') {
-      if (myId && data.eventId) deleteEvent(data.eventId);
+    // ── ACK сообщения ────────────────────────────────────────────────────────
+    if(data.type === 'ack-msg') {
+      if(!myId) return;
+      const row = stmtAckMsg.get(myId, data.msgId);
+      if(row) {
+        stmtDeleteById.run(row.id);
+        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
+        const senderWs = peers.get(row.sender);
+        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId: data.msgId, by: myId, eventId });
+      }
       return;
     }
 
-    // Запрос присутствия
-    if (data.type === 'query-presence') {
-      if (!myId) return;
+    // ── ACK события ─────────────────────────────────────────────────────────
+    if(data.type === 'ack-event') {
+      if(myId && data.eventId) stmtDeleteEvent.run(data.eventId);
+      return;
+    }
+
+    // ── Запрос присутствия ───────────────────────────────────────────────────
+    if(data.type === 'query-presence') {
+      if(!myId) return;
       const target = (data.target || '').toLowerCase();
       send(ws, { type: 'presence-reply', target, online: peers.has(target) });
       return;
     }
 
-    // Голосовое прослушано
-    if (data.type === 'voice-listened') {
-      if (!myId) return;
+    // ── Голосовое прослушано ─────────────────────────────────────────────────
+    if(data.type === 'voice-listened') {
+      if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const eventId = enqueueEvent(target, 'voice-listened', {
-        from: myId,
-        voiceMsgId: data.voiceMsgId
-      });
-      const targetWs = peers.get(target);
-      if (targetWs) {
-        send(targetWs, {
-          type: 'voice-listened',
-          from: myId,
-          voiceMsgId: data.voiceMsgId,
-          eventId
-        });
-      }
+      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
+      const tw = peers.get(target);
+      if(tw) send(tw, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
       return;
     }
 
-    // Произвольный сигнал (если нужен)
-    if (data.type === 'signal' && data.target) {
-      const targetWs = peers.get(data.target.toLowerCase());
-      if (targetWs) send(targetWs, { type: 'signal', from: myId, payload: data.payload });
+    // ── Сигнал ───────────────────────────────────────────────────────────────
+    if(data.type === 'signal' && data.target) {
+      const tw = peers.get(data.target.toLowerCase());
+      if(tw) send(tw, { type: 'signal', from: myId, payload: data.payload });
     }
   });
 
   ws.on('close', () => {
-    if (myId) {
-      if (heartbeats.has(myId)) clearTimeout(heartbeats.get(myId));
+    if(myId) {
+      clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
-      if (peers.get(myId) === ws) {
+      if(peers.get(myId) === ws) {
         peers.delete(myId);
         broadcastPresence(myId, false);
       }
     }
   });
+
+  ws.on('error', (err) => {
+    console.error(`WS error [${myId}]:`, err.message);
+  });
 });
 
-// --- САМОПИНГ каждые 4 минуты ---
-const APP_URL = 'https://onrender.com';
+// ─── Самопинг ────────────────────────────────────────────────────────────────
+const APP_URL = 'https://signal-server-aipd.onrender.com';
 setInterval(() => {
-  https.get(APP_URL, (res) => {
-    console.log(`[Self-Ping] Status: ${res.statusCode} - Keep-alive active`);
-  }).on('error', (err) => {
+  https.get(APP_URL, res => {
+    console.log(`[Self-Ping] ${res.statusCode}`);
+  }).on('error', err => {
     console.error(`[Self-Ping] Error: ${err.message}`);
   });
-}, 4 * 60 * 1000); // 4 минуты
+}, 4 * 60 * 1000);
 
-console.log(`[server] SQLite + WebSocket + Groups ready on port ${PORT}`);
+console.log(`[K-Chat server] ready on port ${PORT}`);
