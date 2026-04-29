@@ -8,8 +8,8 @@ const https = require('https');
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('cache_size = -8000');
+db.pragma('synchronous = NORMAL');   // быстрее чем FULL, безопасно при WAL
+db.pragma('cache_size = -8000');     // 8 МБ кэш
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
@@ -33,7 +33,7 @@ db.exec(`
   );
 `);
 
-// ─── Подготовленные запросы ─────────────────────────────────────────────────
+// ─── Подготовленные запросы (быстрее повторных парсингов) ─────────────────────
 const stmtInsertEvent  = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
 const stmtGetEvents    = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
 const stmtDeleteEvent  = db.prepare(`DELETE FROM events WHERE id=?`);
@@ -44,7 +44,9 @@ const stmtAckMsg       = db.prepare(`
   LIMIT 1
 `);
 const stmtDeleteById   = db.prepare(`DELETE FROM events WHERE id=?`);
-const stmtDeleteOldEvents = db.prepare(`DELETE FROM events WHERE created_at < ?`);
+
+// Batch-удаление событий (для быстрой очистки файловых чанков)
+const stmtDeleteByRecipientType = db.prepare(`DELETE FROM events WHERE recipient_id=? AND type=?`);
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
 const pushFile = path.join(__dirname, 'push_subscriptions.json');
@@ -71,30 +73,14 @@ async function sendPush(userId, message) {
   } catch(e) {}
 }
 
-// ─── Очистка старых событий (старше 14 дней) ──────────────────────────────
-const EVENT_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // 14 дней в миллисекундах
-
-function cleanOldEvents() {
-  const cutoff = Date.now() - EVENT_MAX_AGE_MS;
-  const result = stmtDeleteOldEvents.run(cutoff);
-  if (result.changes > 0) {
-    console.log(`[cleanup] удалено ${result.changes} событий старше 14 дней`);
-  }
-}
-
-// Запускаем очистку каждые 6 часов
-setInterval(cleanOldEvents, 6 * 60 * 60 * 1000);
-// И сразу при старте
-cleanOldEvents();
-
 // ─── WebSocket сервер ─────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({
   port: PORT,
-  maxPayload: 256 * 1024 * 1024   // 256 МБ
+  maxPayload: 256 * 1024 * 1024   // 256 МБ — на случай очень больших чанков
 });
 
-const peers = new Map();
+const peers = new Map();           // peerId → WebSocket
 const heartbeats = new Map();
 const HEARTBEAT_TIMEOUT = 60_000;
 
@@ -165,6 +151,7 @@ wss.on('connection', (ws) => {
       const newId = (data.peerId || '').toLowerCase().trim();
       if(!newId) return;
 
+      // Закрываем старое соединение если есть
       const old = peers.get(newId);
       if(old && old !== ws && old.readyState === WebSocket.OPEN) old.close();
 
@@ -315,8 +302,7 @@ wss.on('connection', (ws) => {
           } else {
             sendPush(mid, 'Новое сообщение в группе').catch(() => {});
           }
-          // КЛЮЧ: isChunk === true не сохраняем в очередь
-          if(!ephemeral && !isChunk) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
+          if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
         });
         return;
       }
@@ -324,14 +310,16 @@ wss.on('connection', (ws) => {
       // Личная отправка
       const targetWs = peers.get(target);
       if(targetWs) {
+        // Получатель онлайн — доставляем напрямую, мгновенно
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        // Сохраняем в очередь ТОЛЬКО если это не чанк и не эфемерное
+        // КЛЮЧЕВАЯ ОПТИМИЗАЦИЯ: файловые чанки НЕ сохраняем в SQLite если получатель онлайн
+        // Это убирает bottleneck записи на диск для каждого чанка (20+ записей для 5МБ файла)
         if(!ephemeral && !isChunk) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
       } else {
-        // Получатель офлайн: чанки НЕ сохраняем, заголовки и обычные сообщения — да
-        if(!ephemeral && !isChunk) {
+        // Получатель офлайн — сохраняем всё в очередь
+        if(!ephemeral) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
         sendPush(target, 'Новое сообщение').catch(() => {});
