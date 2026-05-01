@@ -288,7 +288,7 @@ wss.on('connection', (ws) => {
     if(data.type === 'send-msg') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const { msgId, payload, ephemeral } = data;
+      const { msgId, payload, ephemeral, isChunk } = data;
       if(!target || !msgId || !payload) return;
 
       // Групповая отправка
@@ -310,11 +310,15 @@ wss.on('connection', (ws) => {
       // Личная отправка
       const targetWs = peers.get(target);
       if(targetWs) {
+        // Получатель онлайн — доставляем напрямую, мгновенно
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        if(!ephemeral) {
+        // КЛЮЧЕВАЯ ОПТИМИЗАЦИЯ: файловые чанки НЕ сохраняем в SQLite если получатель онлайн
+        // Это убирает bottleneck записи на диск для каждого чанка (20+ записей для 5МБ файла)
+        if(!ephemeral && !isChunk) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
       } else {
+        // Получатель офлайн — сохраняем всё в очередь
         if(!ephemeral) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
