@@ -8,8 +8,8 @@ const https = require('https');
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('cache_size = -8000');
+db.pragma('synchronous = NORMAL');   // быстрее чем FULL, безопасно при WAL
+db.pragma('cache_size = -8000');     // 8 МБ кэш
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
@@ -31,22 +31,9 @@ db.exec(`
     members     TEXT DEFAULT '[]',
     created_at  INTEGER NOT NULL
   );
-
-  CREATE TABLE IF NOT EXISTS file_chunks (
-    fileId       TEXT NOT NULL,
-    recipient_id TEXT NOT NULL,
-    idx          INTEGER NOT NULL,
-    total        INTEGER NOT NULL,
-    data         TEXT NOT NULL,
-    header       TEXT,
-    created_at   INTEGER NOT NULL,
-    PRIMARY KEY (fileId, idx)
-  );
-  CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks (fileId);
-  CREATE INDEX IF NOT EXISTS idx_file_chunks_recipient ON file_chunks (recipient_id);
 `);
 
-// ─── Подготовленные запросы ───────────────────────────────────────────────────
+// ─── Подготовленные запросы (быстрее повторных парсингов) ─────────────────────
 const stmtInsertEvent  = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
 const stmtGetEvents    = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
 const stmtDeleteEvent  = db.prepare(`DELETE FROM events WHERE id=?`);
@@ -58,12 +45,8 @@ const stmtAckMsg       = db.prepare(`
 `);
 const stmtDeleteById   = db.prepare(`DELETE FROM events WHERE id=?`);
 
-// Запросы для file_chunks
-const stmtInsertChunk  = db.prepare(`INSERT OR REPLACE INTO file_chunks (fileId,recipient_id,idx,total,data,header,created_at) VALUES (?,?,?,?,?,?,?)`);
-const stmtGetChunk     = db.prepare(`SELECT * FROM file_chunks WHERE fileId=? AND idx=?`);
-const stmtGetChunksByFile = db.prepare(`SELECT * FROM file_chunks WHERE fileId=? ORDER BY idx`);
-const stmtDeleteChunks = db.prepare(`DELETE FROM file_chunks WHERE fileId=?`);
-const stmtGetDistinctFileIds = db.prepare(`SELECT DISTINCT fileId FROM file_chunks WHERE recipient_id=?`);
+// Batch-удаление событий (для быстрой очистки файловых чанков)
+const stmtDeleteByRecipientType = db.prepare(`DELETE FROM events WHERE recipient_id=? AND type=?`);
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
 const pushFile = path.join(__dirname, 'push_subscriptions.json');
@@ -94,10 +77,10 @@ async function sendPush(userId, message) {
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({
   port: PORT,
-  maxPayload: 256 * 1024 * 1024   // 256 МБ
+  maxPayload: 256 * 1024 * 1024   // 256 МБ — на случай очень больших чанков
 });
 
-const peers = new Map();
+const peers = new Map();           // peerId → WebSocket
 const heartbeats = new Map();
 const HEARTBEAT_TIMEOUT = 60_000;
 
@@ -155,11 +138,6 @@ function removeMember(groupId, peerId) {
   stmtUpdateGroupMbrs.run(JSON.stringify(members), groupId);
 }
 
-// ─── Функция сохранения файлового чанка ──────────────────────────────────────
-function storeFileChunk(recipientId, fileId, idx, total, data, header = null) {
-  stmtInsertChunk.run(fileId, recipientId, idx, total, data, header ? JSON.stringify(header) : null, Date.now());
-}
-
 // ─── Соединения ──────────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
   let myId = null;
@@ -183,19 +161,9 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Доставляем накопленную очередь событий
+      // Доставляем накопленную очередь
       const events = getEvents(myId);
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
-
-      // Доставляем сохранённые файловые чанки
-      const fileIds = stmtGetDistinctFileIds.all(myId);
-      for(const f of fileIds) {
-        const chunks = stmtGetChunksByFile.all(f.fileId);
-        for(const c of chunks) {
-          // Отправляем чанк как incoming-msg
-          send(ws, { type: 'incoming-msg', from: 'server', msgId: f.fileId, payload: c.data });
-        }
-      }
       return;
     }
 
@@ -342,40 +310,20 @@ wss.on('connection', (ws) => {
       // Личная отправка
       const targetWs = peers.get(target);
       if(targetWs) {
-        // Получатель онлайн — доставляем напрямую
+        // Получатель онлайн — доставляем напрямую, мгновенно
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-      } else {
-        // Получатель офлайн — сохраняем в очередь
-        sendPush(target, 'Новое сообщение').catch(() => {});
-      }
-
-      // Всегда сохраняем в офлайн-очередь (кроме ephemeral)
-      if(!ephemeral) {
-        // Проверяем, не файловый ли это чанк (для больших данных используем file_chunks)
-        const isFileChunk = typeof payload === 'string' && payload.length > 1024;
-        if(isFileChunk) {
-          // Попробуем распарсить как JSON чтобы понять тип
-          try {
-            // Данные зашифрованы, но мы можем сохранить как есть
-            // Для файловых чанков используем отдельную таблицу
-            // Но мы не можем расшифровать здесь, поэтому сохраняем как incoming-msg
-            enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
-          } catch(e) {
-            enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
-          }
-        } else {
+        // ВСЕ не-ephemeral сообщения попадают в офлайн-очередь
+        // Это включает в себя как обычные сообщения, так и файловые чанки (file-header / file-chunk)
+        if(!ephemeral) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
+      } else {
+        // Получатель офлайн — сохраняем в очередь
+        if(!ephemeral) {
+          enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+        }
+        sendPush(target, 'Новое сообщение').catch(() => {});
       }
-      return;
-    }
-
-    // ── Файл собран (подтверждение от получателя) ────────────────────────────
-    if(data.type === 'file-assembled') {
-      if(!myId) return;
-      // Удаляем все чанки этого файла (если они хранятся на сервере)
-      stmtDeleteChunks.run(data.fileId);
-      console.log(`[file-assembled] fileId=${data.fileId}, cleaned server chunks`);
       return;
     }
 
