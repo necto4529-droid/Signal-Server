@@ -8,8 +8,8 @@ const https = require('https');
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');   // быстрее чем FULL, безопасно при WAL
-db.pragma('cache_size = -8000');     // 8 МБ кэш
+db.pragma('synchronous = NORMAL');
+db.pragma('cache_size = -8000');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
@@ -20,6 +20,17 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
+
+  CREATE TABLE IF NOT EXISTS file_chunks (
+    file_id    TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    chunk_data TEXT NOT NULL,
+    total_chunks INTEGER NOT NULL,
+    header_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (file_id, chunk_index)
+  );
+  CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks (file_id);
 
   CREATE TABLE IF NOT EXISTS groups (
     id          TEXT PRIMARY KEY,
@@ -33,7 +44,7 @@ db.exec(`
   );
 `);
 
-// ─── Подготовленные запросы (быстрее повторных парсингов) ─────────────────────
+// ─── Подготовленные запросы ──────────────────────────────────────────────────
 const stmtInsertEvent  = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
 const stmtGetEvents    = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
 const stmtDeleteEvent  = db.prepare(`DELETE FROM events WHERE id=?`);
@@ -44,9 +55,13 @@ const stmtAckMsg       = db.prepare(`
   LIMIT 1
 `);
 const stmtDeleteById   = db.prepare(`DELETE FROM events WHERE id=?`);
-
-// Batch-удаление событий (для быстрой очистки файловых чанков)
 const stmtDeleteByRecipientType = db.prepare(`DELETE FROM events WHERE recipient_id=? AND type=?`);
+
+// Запросы для чанков
+const stmtInsertChunk  = db.prepare(`INSERT OR REPLACE INTO file_chunks (file_id,chunk_index,chunk_data,total_chunks,header_json,created_at) VALUES (?,?,?,?,?,?)`);
+const stmtGetChunk     = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? AND chunk_index=?`);
+const stmtGetAllChunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`);
+const stmtDeleteChunks = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`);
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
 const pushFile = path.join(__dirname, 'push_subscriptions.json');
@@ -77,10 +92,10 @@ async function sendPush(userId, message) {
 const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({
   port: PORT,
-  maxPayload: 256 * 1024 * 1024   // 256 МБ — на случай очень больших чанков
+  maxPayload: 256 * 1024 * 1024
 });
 
-const peers = new Map();           // peerId → WebSocket
+const peers = new Map();
 const heartbeats = new Map();
 const HEARTBEAT_TIMEOUT = 60_000;
 
@@ -138,6 +153,21 @@ function removeMember(groupId, peerId) {
   stmtUpdateGroupMbrs.run(JSON.stringify(members), groupId);
 }
 
+// ─── Файловые чанки на сервере ───────────────────────────────────────────────
+function saveChunk(fileId, chunkIndex, chunkData, totalChunks, headerJson) {
+  stmtInsertChunk.run(fileId, chunkIndex, chunkData, totalChunks, JSON.stringify(headerJson), Date.now());
+  console.log(`[chunk] saved ${fileId} [${chunkIndex+1}/${totalChunks}]`);
+}
+
+function getFileChunks(fileId) {
+  return stmtGetAllChunks.all(fileId);
+}
+
+function deleteFileChunks(fileId) {
+  stmtDeleteChunks.run(fileId);
+  console.log(`[chunk] deleted all chunks for ${fileId}`);
+}
+
 // ─── Соединения ──────────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
   let myId = null;
@@ -151,7 +181,6 @@ wss.on('connection', (ws) => {
       const newId = (data.peerId || '').toLowerCase().trim();
       if(!newId) return;
 
-      // Закрываем старое соединение если есть
       const old = peers.get(newId);
       if(old && old !== ws && old.readyState === WebSocket.OPEN) old.close();
 
@@ -161,7 +190,6 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Доставляем накопленную очередь
       const events = getEvents(myId);
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
       return;
@@ -181,7 +209,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── Создание группы ──────────────────────────────────────────────────────
+    // ── Группы (без изменений) ──────────────────────────────────────────────
     if(data.type === 'create-group') {
       if(!myId) return;
       if(getGroupInvite(data.inviteCode) || getGroup(data.groupId)) {
@@ -288,7 +316,7 @@ wss.on('connection', (ws) => {
     if(data.type === 'send-msg') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const { msgId, payload, ephemeral } = data;
+      const { msgId, payload, ephemeral, isChunk } = data;
       if(!target || !msgId || !payload) return;
 
       // Групповая отправка
@@ -297,11 +325,8 @@ wss.on('connection', (ws) => {
         JSON.parse(g.members).forEach(mid => {
           if(mid === myId) return;
           const mw = peers.get(mid);
-          if(mw) {
-            send(mw, { type: 'incoming-msg', from: myId, msgId, payload });
-          } else {
-            sendPush(mid, 'Новое сообщение в группе').catch(() => {});
-          }
+          if(mw) { send(mw, { type: 'incoming-msg', from: myId, msgId, payload }); }
+          else { sendPush(mid, 'Новое сообщение в группе').catch(() => {}); }
           if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
         });
         return;
@@ -310,19 +335,65 @@ wss.on('connection', (ws) => {
       // Личная отправка
       const targetWs = peers.get(target);
       if(targetWs) {
-        // Получатель онлайн — доставляем напрямую, мгновенно
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        // ВСЕ не-ephemeral сообщения попадают в офлайн-очередь
-        // Это включает в себя как обычные сообщения, так и файловые чанки (file-header / file-chunk)
-        if(!ephemeral) {
+        // КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: сохраняем чанки на сервере!
+        // ВАЖНО: все сообщения (включая чанки) сохраняются в очередь, если получатель онлайн,
+        // но чанки сохраняются ОТДЕЛЬНО в таблицу file_chunks для последующей досылки
+        if(!ephemeral && !isChunk) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
       } else {
-        // Получатель офлайн — сохраняем в очередь
+        // Получатель офлайн — сохраняем ВСЁ в очередь
         if(!ephemeral) {
           enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         }
         sendPush(target, 'Новое сообщение').catch(() => {});
+      }
+
+      // ─── СОХРАНЕНИЕ ЧАНКОВ НА СЕРВЕРЕ ──────────────────────────────────────
+      // Независимо от того, онлайн получатель или нет, чанки сохраняются на сервере
+      if(isChunk && payload) {
+        try {
+          // Декодируем payload чтобы извлечь данные чанка и заголовка
+          // payload приходит как base64 строка от клиента
+          const decodedPayload = payload; // сервер не расшифровывает — просто хранит
+          
+          // Пытаемся извлечь fileId и индекс чанка из данных
+          // Клиент отправляет isChunk только для чанков, так что мы знаем что это чанк
+          // Для file-header: data содержит totalChunks и имя файла
+          // Для file-chunk: data содержит index и data
+          
+          // ВНИМАНИЕ: сервер работает с зашифрованными данными, поэтому мы не можем
+          // прочитать fileId напрямую из payload. Вместо этого используем msgId как fileId!
+          // Клиент теперь отправляет ОДИН msgId для всех чанков одного файла.
+          
+          // Сохраняем чанк, используя msgId как fileId
+          // и добавляем маркер в таблицу, что это чанк
+          // Но так как мы не можем отличить заголовок от чанка не расшифровывая,
+          // а расшифровывать на сервере мы не должны (E2EE),
+          // мы будем сохранять ВСЕ isChunk сообщения как чанки в file_chunks
+          
+          // Решение: клиент добавляет в data.chunkIndex и data.totalChunks на верхнем уровне
+          // прямо в объекте data перед шифрованием (см. клиентский код)
+          // НО так как поле зашифровано, сервер не может его прочитать.
+          
+          // Пересмотренное решение:
+          // Клиент отправляет chunk index и total chunks НЕЗАШИФРОВАННЫМИ в объекте data
+          // на верхнем уровне, а сам payload содержит зашифрованные данные чанка.
+          // Пример: { type: 'send-msg', target, msgId, payload: encryptedChunkData, chunkIndex: 0, totalChunks: 10 }
+          
+          if(data.chunkIndex !== undefined && data.totalChunks !== undefined) {
+            saveChunk(
+              msgId,                    // fileId
+              data.chunkIndex,
+              payload,                  // зашифрованный чанк
+              data.totalChunks,
+              { target, from: myId }    // мета-заголовок
+            );
+          }
+        } catch(e) {
+          console.error('Failed to save chunk:', e.message);
+        }
       }
       return;
     }
@@ -361,6 +432,38 @@ wss.on('connection', (ws) => {
       const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
       const tw = peers.get(target);
       if(tw) send(tw, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
+      return;
+    }
+
+    // ── Запрос чанков файла (получатель запрашивает у сервера) ───────────────
+    if(data.type === 'file-chunk-request') {
+      if(!myId) return;
+      const { fileId, chunkIndex } = data;
+      if(!fileId) return;
+
+      const chunk = stmtGetChunk.get(fileId, chunkIndex);
+      if(chunk) {
+        send(ws, {
+          type: 'file-chunk-response',
+          fileId,
+          chunkIndex: chunk.chunk_index,
+          totalChunks: chunk.total_chunks,
+          payload: chunk.chunk_data,
+          header: JSON.parse(chunk.header_json)
+        });
+      } else {
+        send(ws, { type: 'file-chunk-missing', fileId, chunkIndex });
+      }
+      return;
+    }
+
+    // ── Подтверждение сборки файла (получатель собрал → удаляем чанки) ──────
+    if(data.type === 'file-assembled') {
+      if(!myId) return;
+      const { fileId } = data;
+      if(!fileId) return;
+      deleteFileChunks(fileId);
+      console.log(`[${myId}] file assembled and chunks deleted: ${fileId}`);
       return;
     }
 
