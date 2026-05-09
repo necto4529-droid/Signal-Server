@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const https = require('https');
 
-// ─── SQLite WAL ───────────────────────────────────────────────────────────────
+// ─── SQLite (только для офлайн-очереди и файлов) ─────────────────────────────
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -135,6 +135,17 @@ const peers = new Map();
 const heartbeats = new Map();
 const HEARTBEAT_TIMEOUT = 60_000;
 
+// Быстрая Map для онлайн-сообщений (не трогает БД)
+const onlineDeliveries = new Map(); // msgId → { sender, ts }
+
+// Очистка старых записей из onlineDeliveries
+setInterval(() => {
+  const now = Date.now();
+  for(const [msgId, info] of onlineDeliveries) {
+    if(now - info.ts > 120_000) onlineDeliveries.delete(msgId);
+  }
+}, 30_000);
+
 function send(ws, obj) {
   if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
@@ -192,11 +203,11 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Очередь обычных событий
+      // Офлайн-очередь
       const events = stmtGetEvents.all(myId).map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
-      // Уведомляем о файлах ожидающих скачивания
+      // Файлы, ожидающие скачивания
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
         const cnt = stmtCountChunks.get(h.file_id);
@@ -230,34 +241,35 @@ wss.on('connection', (ws) => {
         data.mimeType, data.totalChunks, data.caption || '',
         data.ts || Date.now(), Date.now()
       );
-      console.log(`[File] Header saved: ${data.fileId} → ${target} (${data.name}, ${data.totalChunks} chunks)`);
       send(ws, { type: 'file-header-ack', fileId: data.fileId });
       return;
     }
 
-    if(data.type === 'upload-file-chunk') {
+    if(data.type === 'upload-file-chunks') {
       if(!myId) return;
-      stmtInsertChunk.run(data.fileId, data.index, data.data, Date.now());
-      const header = stmtGetHeader.get(data.fileId);
+      const { fileId, chunks } = data;
+      if(!fileId || !Array.isArray(chunks)) return;
+      const header = stmtGetHeader.get(fileId);
       if(!header) return;
-      const cnt = stmtCountChunks.get(data.fileId);
+
+      const insertBatch = db.transaction(() => {
+        for(const c of chunks) stmtInsertChunk.run(fileId, c.index, c.data, Date.now());
+      });
+      insertBatch();
+
+      const cnt = stmtCountChunks.get(fileId);
       if(cnt && cnt.cnt >= header.total_chunks) {
-        // Файл загружен полностью — уведомляем отправителя и получателя
-        send(ws, { type: 'file-upload-complete', fileId: data.fileId });
+        send(ws, { type: 'file-upload-complete', fileId });
         const notification = {
           type: 'file-ready',
-          fileId: data.fileId, name: header.name, size: header.size,
+          fileId, name: header.name, size: header.size,
           mimeType: header.mime_type, totalChunks: header.total_chunks,
           caption: header.caption, ts: header.ts, from: myId
         };
         const targetWs = peers.get(header.recipient_id);
         if(targetWs) send(targetWs, notification);
-        // Сохраняем в очередь чтобы получатель получил даже если переподключится
-        // (удалим после file-received)
-        // Сначала удалим старый дубль если был
-        stmtDeleteFileReady.run(header.recipient_id, data.fileId);
+        stmtDeleteFileReady.run(header.recipient_id, fileId);
         enqueueEvent(header.recipient_id, 'file-ready', notification);
-        console.log(`[File] Upload complete: ${data.fileId} (${cnt.cnt}/${header.total_chunks})`);
       }
       return;
     }
@@ -277,10 +289,8 @@ wss.on('connection', (ws) => {
       const chunks = stmtGetChunks.all(data.fileId);
       if(chunks.length < header.total_chunks) {
         send(ws, { type: 'file-fetch-partial', fileId: data.fileId, received: chunks.length, total: header.total_chunks });
-        console.log(`[File] fetch-partial: ${data.fileId} has ${chunks.length}/${header.total_chunks}`);
         return;
       }
-      // Отправляем мета + все чанки + done
       send(ws, {
         type: 'file-fetch-start',
         fileId: data.fileId, name: header.name, size: header.size,
@@ -291,11 +301,9 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'file-fetch-chunk', fileId: data.fileId, index: chunk.chunk_index, data: chunk.data });
       }
       send(ws, { type: 'file-fetch-done', fileId: data.fileId });
-      console.log(`[File] Sent ${chunks.length} chunks to ${myId} for ${data.fileId}`);
       return;
     }
 
-    // ── Подтверждение получения файла ────────────────────────────────────────
     if(data.type === 'file-received') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
@@ -303,7 +311,6 @@ wss.on('connection', (ws) => {
         stmtDeleteChunks.run(data.fileId);
         stmtDeleteHeader.run(data.fileId);
         stmtDeleteFileReady.run(myId, data.fileId);
-        console.log(`[File] Deleted after ack from ${myId}: ${data.fileId}`);
       }
       return;
     }
@@ -320,9 +327,13 @@ wss.on('connection', (ws) => {
         JSON.parse(g.members).forEach(mid => {
           if(mid === myId) return;
           const mw = peers.get(mid);
-          if(mw) send(mw, { type: 'incoming-msg', from: myId, msgId, payload });
-          else sendPush(mid, 'Новое сообщение в группе').catch(() => {});
-          if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
+          if(mw) {
+            send(mw, { type: 'incoming-msg', from: myId, msgId, payload });
+            onlineDeliveries.set(msgId, { sender: myId, ts: Date.now() });
+          } else {
+            if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
+            sendPush(mid, 'Новое сообщение в группе').catch(() => {});
+          }
         });
         return;
       }
@@ -330,7 +341,9 @@ wss.on('connection', (ws) => {
       const targetWs = peers.get(target);
       if(targetWs) {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+        if(!ephemeral) {
+          onlineDeliveries.set(msgId, { sender: myId, ts: Date.now() });
+        }
       } else {
         if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
         sendPush(target, 'Новое сообщение').catch(() => {});
@@ -340,12 +353,23 @@ wss.on('connection', (ws) => {
 
     if(data.type === 'ack-msg') {
       if(!myId) return;
-      const row = stmtAckMsg.get(myId, data.msgId);
+      const msgId = data.msgId;
+      // Быстрый путь: сообщение было доставлено онлайн
+      const od = onlineDeliveries.get(msgId);
+      if(od) {
+        onlineDeliveries.delete(msgId);
+        const eventId = enqueueEvent(od.sender, 'msg-delivered', { msgId, by: myId });
+        const senderWs = peers.get(od.sender);
+        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
+        return;
+      }
+      // Медленный путь: офлайн-сообщение в БД
+      const row = stmtAckMsg.get(myId, msgId);
       if(row) {
         stmtDeleteById.run(row.id);
-        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
+        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId, by: myId });
         const senderWs = peers.get(row.sender);
-        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId: data.msgId, by: myId, eventId });
+        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId, by: myId, eventId });
       }
       return;
     }
