@@ -84,8 +84,11 @@ const stmtCountChunks     = db.prepare(`SELECT COUNT(*) as cnt FROM file_chunks 
 const stmtDeleteChunks    = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`);
 const stmtDeleteHeader    = db.prepare(`DELETE FROM file_headers WHERE file_id=?`);
 const stmtGetPendingFiles = db.prepare(`SELECT * FROM file_headers WHERE recipient_id=?`);
-const stmtDeleteFileReady = db.prepare(`
-  DELETE FROM events WHERE recipient_id=? AND type='file-available'
+
+// Удаление событий file-available для конкретного получателя и fileId
+const stmtDeleteFileAvail = db.prepare(`
+  DELETE FROM events
+  WHERE recipient_id=? AND type='file-available'
     AND json_extract(payload,'$.fileId')=?
 `);
 
@@ -121,6 +124,8 @@ function cleanupOldFiles() {
   for(const { file_id } of old) {
     stmtDeleteChunks.run(file_id);
     stmtDeleteHeader.run(file_id);
+    // Удаляем связанные события file-available
+    db.prepare(`DELETE FROM events WHERE type='file-available' AND json_extract(payload,'$.fileId')=?`).run(file_id);
   }
   if(old.length > 0) console.log(`[Cleanup] Удалено ${old.length} старых файлов`);
 }
@@ -203,9 +208,14 @@ wss.on('connection', (ws) => {
         if(cnt && cnt.cnt >= h.total_chunks) {
           send(ws, {
             type: 'file-available',
-            fileId: h.file_id, name: h.name, size: h.size,
-            mimeType: h.mime_type, totalChunks: h.total_chunks,
-            caption: h.caption, ts: h.ts, from: h.sender_id
+            fileId: h.file_id,
+            senderId: h.sender_id,
+            name: h.name,
+            size: h.size,
+            mimeType: h.mime_type,
+            totalChunks: h.total_chunks,
+            caption: h.caption,
+            ts: h.ts
           });
         }
       }
@@ -221,50 +231,66 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── Загрузка файла на сервер ─────────────────────────────────────────────
+    // ── НОВЫЙ ФАЙЛОВЫЙ ПРОТОКОЛ ─────────────────────────────────────────────
+    // 1. Отправитель регистрирует заголовок файла
     if(data.type === 'store-file-header') {
       if(!myId) return;
-      const target = (data.recipientId || '').toLowerCase();
+      const recipient = (data.recipientId || '').toLowerCase();
+      if(!recipient) return;
       stmtInsertHeader.run(
-        data.fileId, myId, target, data.name, data.size,
+        data.fileId, myId, recipient, data.name, data.size,
         data.mimeType, data.totalChunks, data.caption || '',
         data.ts || Date.now(), Date.now()
       );
-      console.log(`[File] Header stored: ${data.fileId} → ${target} (${data.name}, ${data.totalChunks} chunks)`);
+      console.log(`[File] Header stored: ${data.fileId} → ${recipient} (${data.name})`);
       send(ws, { type: 'store-file-header-ack', fileId: data.fileId });
       return;
     }
 
+    // 2. Отправитель шлёт чанки батчами
     if(data.type === 'store-chunks') {
       if(!myId) return;
-      if(Array.isArray(data.chunks)) {
-        for(const chunk of data.chunks) {
-          stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
-        }
+      const chunks = data.chunks;
+      if(!Array.isArray(chunks)) return;
+
+      for(const chunk of chunks) {
+        stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
       }
+
       const header = stmtGetHeader.get(data.fileId);
       if(!header) return;
       const cnt = stmtCountChunks.get(data.fileId);
       if(cnt && cnt.cnt >= header.total_chunks) {
-        // Файл загружен полностью — уведомляем получателя
-        const notification = {
-          type: 'file-available',  // клиент слушает этот тип
-          fileId: data.fileId, name: header.name, size: header.size,
-          mimeType: header.mime_type, totalChunks: header.total_chunks,
-          caption: header.caption, ts: header.ts, from: myId
+        console.log(`[File] All chunks received: ${data.fileId}`);
+
+        const payload = {
+          fileId: data.fileId,
+          senderId: myId,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          ts: header.ts
         };
-        const targetWs = peers.get(header.recipient_id);
-        if(targetWs) send(targetWs, notification);
-        // удаляем прошлый дубль если есть и сохраняем событие в очередь
-        stmtDeleteFileReady.run(header.recipient_id, data.fileId);
-        enqueueEvent(header.recipient_id, 'file-available', notification);
-        console.log(`[File] Upload complete & notified: ${data.fileId} (${cnt.cnt}/${header.total_chunks})`);
+        const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+        const recipientWs = peers.get(header.recipient_id);
+        if(recipientWs) {
+          send(recipientWs, { type: 'file-available', ...payload, eventId });
+        } else {
+          sendPush(header.recipient_id, `📎 ${header.name}`).catch(() => {});
+        }
+
+        // Подтверждаем отправителю
+        send(ws, { type: 'file-upload-complete', fileId: data.fileId });
+      } else {
+        // Промежуточный ack
+        send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       }
-      send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       return;
     }
 
-    // ── Скачивание файла ─────────────────────────────────────────────────────
+    // 3. Получатель запрашивает файл для скачивания
     if(data.type === 'fetch-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
@@ -276,37 +302,56 @@ wss.on('connection', (ws) => {
         send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Нет доступа' });
         return;
       }
+
       const chunks = stmtGetChunks.all(data.fileId);
       if(chunks.length < header.total_chunks) {
-        send(ws, { type: 'file-fetch-partial', fileId: data.fileId, received: chunks.length, total: header.total_chunks });
-        console.log(`[File] fetch-partial: ${data.fileId} has ${chunks.length}/${header.total_chunks}`);
+        send(ws, {
+          type: 'file-fetch-partial',
+          fileId: data.fileId,
+          received: chunks.length,
+          total: header.total_chunks
+        });
+        console.log(`[File] Partial fetch: ${data.fileId} has ${chunks.length}/${header.total_chunks}`);
         return;
       }
 
-      // Отправляем метаинформацию как file-data-header (клиент ожидает)
+      // Отправляем мета-данные
       send(ws, {
         type: 'file-data-header',
-        fileId: data.fileId, name: header.name, size: header.size,
-        mimeType: header.mime_type, totalChunks: header.total_chunks,
-        caption: header.caption, ts: header.ts, senderId: header.sender_id
+        fileId: data.fileId,
+        senderId: header.sender_id,
+        name: header.name,
+        size: header.size,
+        mimeType: header.mime_type,
+        totalChunks: header.total_chunks,
+        caption: header.caption,
+        ts: header.ts
       });
-      // Чанки как file-data-chunk
+
+      // Отправляем чанки по одному
       for(const chunk of chunks) {
-        send(ws, { type: 'file-data-chunk', fileId: data.fileId, index: chunk.chunk_index, data: chunk.data, total: header.total_chunks });
+        send(ws, {
+          type: 'file-data-chunk',
+          fileId: data.fileId,
+          index: chunk.chunk_index,
+          total: header.total_chunks,
+          data: chunk.data
+        });
       }
+
       console.log(`[File] Sent ${chunks.length} chunks to ${myId} for ${data.fileId}`);
       return;
     }
 
-    // ── Подтверждение получения и удаление ──────────────────────────────────
+    // 4. Получатель подтверждает полное получение и сборку файла
     if(data.type === 'ack-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
       if(header && (header.recipient_id === myId || header.sender_id === myId)) {
         stmtDeleteChunks.run(data.fileId);
         stmtDeleteHeader.run(data.fileId);
-        stmtDeleteFileReady.run(myId, data.fileId);
-        console.log(`[File] Deleted after ack from ${myId}: ${data.fileId}`);
+        stmtDeleteFileAvail.run(myId, data.fileId);
+        console.log(`[File] Cleaned up after ack from ${myId}: ${data.fileId}`);
       }
       return;
     }
