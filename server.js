@@ -85,7 +85,7 @@ const stmtDeleteChunks    = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`
 const stmtDeleteHeader    = db.prepare(`DELETE FROM file_headers WHERE file_id=?`);
 const stmtGetPendingFiles = db.prepare(`SELECT * FROM file_headers WHERE recipient_id=?`);
 
-// Удаление событий file-available для конкретного получателя и fileId
+// Удаление всех событий file-available для конкретного получателя и fileId
 const stmtDeleteFileAvail = db.prepare(`
   DELETE FROM events
   WHERE recipient_id=? AND type='file-available'
@@ -124,7 +124,6 @@ function cleanupOldFiles() {
   for(const { file_id } of old) {
     stmtDeleteChunks.run(file_id);
     stmtDeleteHeader.run(file_id);
-    // Удаляем связанные события file-available
     db.prepare(`DELETE FROM events WHERE type='file-available' AND json_extract(payload,'$.fileId')=?`).run(file_id);
   }
   if(old.length > 0) console.log(`[Cleanup] Удалено ${old.length} старых файлов`);
@@ -197,13 +196,18 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Очередь обычных событий
+      // Очередь обычных событий (кроме file-available — отправим отдельно ниже)
       const events = stmtGetEvents.all(myId).map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
       // Уведомляем о файлах ожидающих скачивания
+      // Дедупликация: не шлём если уже есть в events выше
+      const sentFileIds = new Set(
+        events.filter(e => e.type === 'file-available').map(e => e.payload.fileId)
+      );
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
+        if(sentFileIds.has(h.file_id)) continue; // уже отправили через очередь
         const cnt = stmtCountChunks.get(h.file_id);
         if(cnt && cnt.cnt >= h.total_chunks) {
           send(ws, {
@@ -231,7 +235,8 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── НОВЫЙ ФАЙЛОВЫЙ ПРОТОКОЛ ─────────────────────────────────────────────
+    // ── ФАЙЛОВЫЙ ПРОТОКОЛ ────────────────────────────────────────────────────
+
     // 1. Отправитель регистрирует заголовок файла
     if(data.type === 'store-file-header') {
       if(!myId) return;
@@ -273,18 +278,21 @@ wss.on('connection', (ws) => {
           caption: header.caption,
           ts: header.ts
         };
-        const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+
         const recipientWs = peers.get(header.recipient_id);
         if(recipientWs) {
+          // Получатель онлайн — шлём напрямую И сохраняем в очередь
+          // (он подтвердит через ack-event и мы удалим из очереди)
+          const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
           send(recipientWs, { type: 'file-available', ...payload, eventId });
         } else {
+          // Офлайн — только очередь + push
+          enqueueEvent(header.recipient_id, 'file-available', payload);
           sendPush(header.recipient_id, `📎 ${header.name}`).catch(() => {});
         }
 
-        // Подтверждаем отправителю
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
       } else {
-        // Промежуточный ack
         send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       }
       return;
@@ -315,7 +323,6 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // Отправляем мета-данные
       send(ws, {
         type: 'file-data-header',
         fileId: data.fileId,
@@ -328,7 +335,6 @@ wss.on('connection', (ws) => {
         ts: header.ts
       });
 
-      // Отправляем чанки по одному
       for(const chunk of chunks) {
         send(ws, {
           type: 'file-data-chunk',
@@ -343,7 +349,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // 4. Получатель подтверждает полное получение и сборку файла
+    // 4. Получатель подтверждает полное получение файла
     if(data.type === 'ack-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
