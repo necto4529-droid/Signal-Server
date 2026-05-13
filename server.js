@@ -230,10 +230,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ══════════════════════════════════════════════════════════════
-    // НОВЫЙ ФАЙЛОВЫЙ ПРОТОКОЛ
-    // ══════════════════════════════════════════════════════════════
-
+    // ── ФАЙЛОВЫЙ ПРОТОКОЛ ────────────────────────────────────────────────────
     // 1. Отправитель регистрирует заголовок файла
     if(data.type === 'store-file-header') {
       if(!myId) return;
@@ -353,6 +350,14 @@ wss.on('connection', (ws) => {
         stmtDeleteHeader.run(data.fileId);
         stmtDeleteFileAvail.run(myId, data.fileId);
         console.log(`[File] Cleaned up after ack from ${myId}: ${data.fileId}`);
+
+        // Уведомляем отправителя о доставке файла
+        if(header.sender_id !== myId) {
+          const deliveryPayload = { fileId: data.fileId, by: myId };
+          const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+          const senderWs = peers.get(header.sender_id);
+          if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+        }
       }
       return;
     }
