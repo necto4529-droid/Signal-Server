@@ -85,7 +85,6 @@ const stmtDeleteChunks    = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`
 const stmtDeleteHeader    = db.prepare(`DELETE FROM file_headers WHERE file_id=?`);
 const stmtGetPendingFiles = db.prepare(`SELECT * FROM file_headers WHERE recipient_id=?`);
 
-// удаление всех событий file-available для получателя и конкретного fileId
 const stmtDeleteFileAvail = db.prepare(`
   DELETE FROM events
   WHERE recipient_id=? AND type='file-available'
@@ -196,11 +195,9 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Очередь обычных событий
       const events = stmtGetEvents.all(myId).map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
-      // Уведомляем о файлах ожидающих скачивания
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
         const cnt = stmtCountChunks.get(h.file_id);
@@ -230,8 +227,21 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── НОВЫЙ ТИП: подтверждение получения уведомления о файле ─────────────
+    if(data.type === 'file-available-ack') {
+      if(!myId) return;
+      const header = stmtGetHeader.get(data.fileId);
+      if(header && header.recipient_id === myId) {
+        // Уведомляем отправителя, что файл «доставлен» (показан в чате)
+        const deliveryPayload = { fileId: data.fileId, by: myId };
+        const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+        const senderWs = peers.get(header.sender_id);
+        if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+      }
+      return;
+    }
+
     // ── ФАЙЛОВЫЙ ПРОТОКОЛ ────────────────────────────────────────────────────
-    // 1. Отправитель регистрирует заголовок файла
     if(data.type === 'store-file-header') {
       if(!myId) return;
       const recipient = (data.recipientId || '').toLowerCase();
@@ -246,7 +256,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // 2. Отправитель шлёт чанки батчами
     if(data.type === 'store-chunks') {
       if(!myId) return;
       const chunks = data.chunks;
@@ -262,7 +271,6 @@ wss.on('connection', (ws) => {
       if(cnt && cnt.cnt >= header.total_chunks) {
         console.log(`[File] All chunks received: ${data.fileId}`);
 
-        // Уведомляем получателя (file-available) и кладём в очередь
         const payload = {
           fileId: data.fileId,
           senderId: myId,
@@ -288,7 +296,6 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // 3. Получатель запрашивает файл для скачивания
     if(data.type === 'fetch-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
@@ -313,7 +320,6 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // Отправляем мета-данные
       send(ws, {
         type: 'file-data-header',
         fileId: data.fileId,
@@ -326,7 +332,6 @@ wss.on('connection', (ws) => {
         ts: header.ts
       });
 
-      // Чанки по одному
       for(const chunk of chunks) {
         send(ws, {
           type: 'file-data-chunk',
@@ -341,7 +346,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // 4. Получатель подтверждает полное получение и сборку файла
+    // Удаление после полной загрузки (подтверждение скачивания)
     if(data.type === 'ack-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
@@ -350,14 +355,7 @@ wss.on('connection', (ws) => {
         stmtDeleteHeader.run(data.fileId);
         stmtDeleteFileAvail.run(myId, data.fileId);
         console.log(`[File] Cleaned up after ack from ${myId}: ${data.fileId}`);
-
-        // Уведомляем отправителя о доставке файла
-        if(header.sender_id !== myId) {
-          const deliveryPayload = { fileId: data.fileId, by: myId };
-          const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
-          const senderWs = peers.get(header.sender_id);
-          if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
-        }
+        // Галочка уже была отправлена через file-available-ack, поэтому здесь не дублируем
       }
       return;
     }
