@@ -138,13 +138,6 @@ const MAX_CONNS_PER_IP = 8;
 const wss = new WebSocket.Server({
   port: PORT,
   maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
-  perMessageDeflate: {
-    zlibDeflateOptions: { level: 6, memLevel: 8 },
-    zlibInflateOptions: { windowBits: 15 | 16 },
-    clientNoContextTakeover: true,
-    serverNoContextTakeover: true,
-    threshold: 1024
-  },
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -165,10 +158,9 @@ const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
 
 // Rate limiting: не более 30 сообщений в секунду с одного подключения
 const rateLimits = new Map();
-
 function checkRateLimit(ws) {
   const now = Date.now();
-  const window = 1000;
+  const window = 1000; // 1 секунда
   let entry = rateLimits.get(ws);
   if (!entry) {
     entry = { count: 1, start: now };
