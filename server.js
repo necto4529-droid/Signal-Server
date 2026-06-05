@@ -79,7 +79,6 @@ const stmtInsertChunk     = db.prepare(`
   VALUES (?,?,?,?)
 `);
 const stmtGetHeader       = db.prepare(`SELECT * FROM file_headers WHERE file_id=?`);
-// stmtGetChunks больше не нужен — используем итератор
 const stmtCountChunks     = db.prepare(`SELECT COUNT(*) as cnt FROM file_chunks WHERE file_id=?`);
 const stmtDeleteChunks    = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`);
 const stmtDeleteHeader    = db.prepare(`DELETE FROM file_headers WHERE file_id=?`);
@@ -136,8 +135,7 @@ const wss = new WebSocket.Server({ port: PORT, maxPayload: 256 * 1024 * 1024 });
 
 const peers = new Map();
 const heartbeats = new Map();
-// 5 минут — достаточно для передачи больших файлов
-const HEARTBEAT_TIMEOUT = 300_000;
+const HEARTBEAT_TIMEOUT = 300_000; // 5 минут
 
 function send(ws, obj) {
   if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -222,7 +220,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if(data.type === 'ping') { /* heartbeat уже продлён выше */ return; }
+    if(data.type === 'ping') { return; }
 
     if(data.type === 'register-push') {
       if(!myId || !data.playerId) return;
@@ -312,7 +310,6 @@ wss.on('connection', (ws) => {
       }
 
       const totalChunks = header.total_chunks;
-      // Проверяем количество чанков
       const cnt = stmtCountChunks.get(data.fileId);
       if(!cnt || cnt.cnt < totalChunks) {
         send(ws, {
@@ -336,7 +333,7 @@ wss.on('connection', (ws) => {
         ts: header.ts
       });
 
-      // ★ ПОТОКОВАЯ ОТПРАВКА ЧАНКОВ — без загрузки всего файла в память
+      // ПОТОКОВАЯ ОТПРАВКА ЧАНКОВ
       const chunkIterator = db.prepare(
         `SELECT chunk_index, data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`
       ).iterate(data.fileId);
@@ -345,7 +342,6 @@ wss.on('connection', (ws) => {
         try {
           for (const chunk of chunkIterator) {
             if (ws.readyState !== WebSocket.OPEN) break;
-            // Контроль переполнения буфера
             while (ws.bufferedAmount > 256 * 1024 && ws.readyState === WebSocket.OPEN) {
               await new Promise(r => setTimeout(r, 5));
             }
@@ -357,7 +353,6 @@ wss.on('connection', (ws) => {
               total: totalChunks,
               data: chunk.data
             });
-            // Микро-пауза, чтобы не забивать event loop
             await new Promise(r => setTimeout(r, 0));
           }
         } catch (err) {
@@ -384,14 +379,170 @@ wss.on('connection', (ws) => {
 
     // ── Обычные сообщения ────────────────────────────────────────────────────
     if(data.type === 'send-msg') {
-      // ... код без изменений ...
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      const { msgId, payload, ephemeral } = data;
+      if(!target || !msgId || !payload) return;
+
+      if(target.startsWith('grp_')) {
+        const g = getGroup(target); if(!g) return;
+        JSON.parse(g.members).forEach(mid => {
+          if(mid === myId) return;
+          const mw = peers.get(mid);
+          if(mw) send(mw, { type: 'incoming-msg', from: myId, msgId, payload });
+          else sendPush(mid, 'Новое сообщение в группе').catch(() => {});
+          if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
+        });
+        return;
+      }
+
+      const targetWs = peers.get(target);
+      if(targetWs) {
+        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
+        if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      } else {
+        if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+        sendPush(target, 'Новое сообщение').catch(() => {});
+      }
+      return;
     }
 
-    // ... остальные обработчики без изменений (ack-msg, группы и т.д.)
+    if(data.type === 'ack-msg') {
+      if(!myId) return;
+      const row = stmtAckMsg.get(myId, data.msgId);
+      if(row) {
+        stmtDeleteById.run(row.id);
+        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
+        const senderWs = peers.get(row.sender);
+        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId: data.msgId, by: myId, eventId });
+      }
+      return;
+    }
+
+    if(data.type === 'ack-event') {
+      if(myId && data.eventId) stmtDeleteEvent.run(data.eventId);
+      return;
+    }
+
+    if(data.type === 'query-presence') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      send(ws, { type: 'presence-reply', target, online: peers.has(target) });
+      return;
+    }
+
+    if(data.type === 'voice-listened') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
+      const tw = peers.get(target);
+      if(tw) send(tw, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
+      return;
+    }
+
+    // ── Группы ───────────────────────────────────────────────────────────────
+    if(data.type === 'create-group') {
+      if(!myId) return;
+      if(getGroupInvite(data.inviteCode) || getGroup(data.groupId)) {
+        send(ws, { type: 'error', msg: 'Группа уже существует' }); return;
+      }
+      stmtCreateGroup.run(data.groupId, data.name, data.creator, data.inviteCode,
+        data.avatar||'👥', data.description||'', JSON.stringify([data.creator]), Date.now());
+      send(ws, { type: 'group-created', groupId: data.groupId });
+      return;
+    }
+    if(data.type === 'group-info') {
+      const g = getGroupInvite(data.inviteCode);
+      if(!g) { send(ws, { type: 'error', msg: 'Группа не найдена' }); return; }
+      send(ws, { type: 'group-info-reply', group: { groupId: g.id, name: g.name, avatar: g.avatar, description: g.description } });
+      return;
+    }
+    if(data.type === 'join-group') {
+      if(!myId) return;
+      const g = getGroupInvite(data.inviteCode);
+      if(!g) { send(ws, { type: 'error', msg: 'Группа не найдена' }); return; }
+      if(JSON.parse(g.members).length >= 20) { send(ws, { type: 'error', msg: 'Группа переполнена' }); return; }
+      if(!addMember(g.id, data.peerId)) { send(ws, { type: 'error', msg: 'Вы уже в группе' }); return; }
+      const updated = getGroup(g.id);
+      const members = JSON.parse(updated.members);
+      send(ws, { type: 'group-joined', groupId: g.id, name: g.name, avatar: g.avatar,
+        description: g.description, inviteCode: g.invite_code, members });
+      members.forEach(mid => {
+        if(mid === data.peerId) return;
+        const ev = { type: 'group-updated', groupId: g.id, members };
+        const tw = peers.get(mid); if(tw) send(tw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-update') {
+      if(!myId) return;
+      const g = getGroup(data.groupId);
+      if(!g || g.creator_id !== myId) return;
+      stmtUpdateGroup.run(data.changes.name||g.name, data.changes.avatar||g.avatar,
+        data.changes.description||g.description,
+        data.changes.members ? JSON.stringify(data.changes.members) : g.members, data.groupId);
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, changes: data.changes };
+        const tw = peers.get(mid); if(tw) send(tw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-remove-member') {
+      if(!myId) return;
+      const g = getGroup(data.groupId);
+      if(!g || g.creator_id !== myId || data.targetPeerId === myId) return;
+      removeMember(data.groupId, data.targetPeerId);
+      const updated = getGroup(data.groupId);
+      const tw = peers.get(data.targetPeerId);
+      const removedEv = { type: 'group-member-removed', groupId: data.groupId, targetPeerId: data.targetPeerId };
+      if(tw) send(tw, removedEv); else enqueueEvent(data.targetPeerId, 'group-member-removed', removedEv);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, members: JSON.parse(updated.members) };
+        const mw = peers.get(mid); if(mw) send(mw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-leave') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      removeMember(data.groupId, data.peerId);
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, members: JSON.parse(updated.members) };
+        const mw = peers.get(mid); if(mw) send(mw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-members') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      send(ws, { type: 'group-members-reply', groupId: data.groupId, members: JSON.parse(g.members) });
+      return;
+    }
+    if(data.type === 'group-read') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      JSON.parse(g.members).forEach(mid => {
+        if(mid === data.readerPeerId) return;
+        const ev = { type: 'group-msg-read', groupId: data.groupId, msgId: data.msgId };
+        const mw = peers.get(mid); if(mw) send(mw, ev); else enqueueEvent(mid, 'group-msg-read', ev);
+      });
+      return;
+    }
+
+    if(data.type === 'signal' && data.target) {
+      const tw = peers.get(data.target.toLowerCase());
+      if(tw) send(tw, { type: 'signal', from: myId, payload: data.payload });
+    }
   });
 
   ws.on('close', () => {
-    // ... код без изменений ...
+    if(myId) {
+      clearTimeout(heartbeats.get(myId));
+      heartbeats.delete(myId);
+      if(peers.get(myId) === ws) { peers.delete(myId); broadcastPresence(myId, false); }
+    }
   });
   ws.on('error', (err) => console.error(`WS error [${myId}]:`, err.message));
 });
