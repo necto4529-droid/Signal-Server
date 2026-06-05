@@ -136,7 +136,8 @@ const wss = new WebSocket.Server({ port: PORT, maxPayload: 256 * 1024 * 1024 });
 
 const peers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 60_000;
+// ★ Увеличено до 5 минут – соединение не рвётся при передаче больших файлов
+const HEARTBEAT_TIMEOUT = 300_000;
 
 function send(ws, obj) {
   if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -183,6 +184,9 @@ wss.on('connection', (ws) => {
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
+    // ★ При ЛЮБОМ входящем сообщении продлеваем жизнь соединению
+    if(myId) resetHeartbeat(myId);
+
     // ── Регистрация ──────────────────────────────────────────────────────────
     if(data.type === 'register') {
       const newId = (data.peerId || '').toLowerCase().trim();
@@ -218,7 +222,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    if(data.type === 'ping') { if(myId) resetHeartbeat(myId); return; }
+    if(data.type === 'ping') { /* heartbeat уже продлён выше */ return; }
 
     if(data.type === 'register-push') {
       if(!myId || !data.playerId) return;
@@ -232,7 +236,6 @@ wss.on('connection', (ws) => {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
       if(header && header.recipient_id === myId) {
-        // Уведомляем отправителя, что файл «доставлен» (показан в чате)
         const deliveryPayload = { fileId: data.fileId, by: myId };
         const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
         const senderWs = peers.get(header.sender_id);
@@ -332,17 +335,22 @@ wss.on('connection', (ws) => {
         ts: header.ts
       });
 
-      for(const chunk of chunks) {
-        send(ws, {
-          type: 'file-data-chunk',
-          fileId: data.fileId,
-          index: chunk.chunk_index,
-          total: header.total_chunks,
-          data: chunk.data
-        });
-      }
+      // ★ Отправка чанков с задержкой 25 мс — предотвращает переполнение буфера
+      (async () => {
+        for(const chunk of chunks) {
+          if(ws.readyState !== WebSocket.OPEN) break; // остановка, если сокет закрыт
+          send(ws, {
+            type: 'file-data-chunk',
+            fileId: data.fileId,
+            index: chunk.chunk_index,
+            total: header.total_chunks,
+            data: chunk.data
+          });
+          await new Promise(resolve => setTimeout(resolve, 25)); // пауза 25 мс
+        }
+      })();
 
-      console.log(`[File] Sent ${chunks.length} chunks to ${myId} for ${data.fileId}`);
+      console.log(`[File] Sending ${chunks.length} chunks to ${myId} for ${data.fileId}`);
       return;
     }
 
@@ -355,7 +363,6 @@ wss.on('connection', (ws) => {
         stmtDeleteHeader.run(data.fileId);
         stmtDeleteFileAvail.run(myId, data.fileId);
         console.log(`[File] Cleaned up after ack from ${myId}: ${data.fileId}`);
-        // Галочка уже была отправлена через file-available-ack, поэтому здесь не дублируем
       }
       return;
     }
