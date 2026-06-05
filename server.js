@@ -1,8 +1,10 @@
 const WebSocket = require('ws');
+const http = require('http');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
+const zlib = require('zlib');
 
 // ─── SQLite WAL ───────────────────────────────────────────────────────────────
 const dbPath = path.join(__dirname, 'offline_queue.db');
@@ -11,13 +13,14 @@ db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 db.pragma('cache_size = -16000');
 db.pragma('temp_store = MEMORY');
+db.pragma('mmap_size = 268435456'); // 256 МБ memory-mapped I/O
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     recipient_id TEXT NOT NULL,
     type         TEXT NOT NULL,
-    payload      TEXT NOT NULL,
+    payload      BLOB NOT NULL,
     created_at   INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
@@ -59,12 +62,12 @@ db.exec(`
 
 // ─── Подготовленные запросы ───────────────────────────────────────────────────
 const stmtInsertEvent     = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
-const stmtGetEvents       = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
+const stmtGetEvents       = db.prepare(`SELECT id, type, payload, created_at FROM events WHERE recipient_id=? ORDER BY created_at`);
 const stmtDeleteEvent     = db.prepare(`DELETE FROM events WHERE id=?`);
 const stmtAckMsg          = db.prepare(`
-  SELECT id, json_extract(payload,'$.from') AS sender
+  SELECT id, json_extract( CAST(payload AS TEXT), '$.from') AS sender
   FROM events
-  WHERE recipient_id=? AND type='incoming-msg' AND json_extract(payload,'$.msgId')=?
+  WHERE recipient_id=? AND type='incoming-msg' AND CAST(payload AS TEXT) LIKE ?
   LIMIT 1
 `);
 const stmtDeleteById      = db.prepare(`DELETE FROM events WHERE id=?`);
@@ -87,7 +90,7 @@ const stmtGetPendingFiles = db.prepare(`SELECT * FROM file_headers WHERE recipie
 const stmtDeleteFileAvail = db.prepare(`
   DELETE FROM events
   WHERE recipient_id=? AND type='file-available'
-    AND json_extract(payload,'$.fileId')=?
+    AND CAST(payload AS TEXT) LIKE ?
 `);
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
@@ -115,6 +118,17 @@ async function sendPush(userId, message) {
   } catch(e) {}
 }
 
+// ─── Утилиты сжатия событий ──────────────────────────────────────────────────
+function compressPayload(jsonObj) {
+  const raw = Buffer.from(JSON.stringify(jsonObj), 'utf-8');
+  return zlib.deflateSync(raw, { level: 6 });
+}
+
+function decompressPayload(buf) {
+  const raw = zlib.inflateSync(buf);
+  return JSON.parse(raw.toString('utf-8'));
+}
+
 // ─── Очистка старых файлов ────────────────────────────────────────────────────
 function cleanupOldFiles() {
   const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
@@ -122,22 +136,72 @@ function cleanupOldFiles() {
   for(const { file_id } of old) {
     stmtDeleteChunks.run(file_id);
     stmtDeleteHeader.run(file_id);
-    db.prepare(`DELETE FROM events WHERE type='file-available' AND json_extract(payload,'$.fileId')=?`).run(file_id);
+    db.prepare(`DELETE FROM events WHERE type='file-available' AND CAST(payload AS TEXT) LIKE ?`).run(`%${file_id}%`);
   }
-  if(old.length > 0) console.log(`[Cleanup] Удалено ${old.length} старых файлов`);
+  if(old.length > 0) console.log('[Cleanup] Удалены старые файлы');
 }
 setInterval(cleanupOldFiles, 60 * 60 * 1000);
 cleanupOldFiles();
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT, maxPayload: 256 * 1024 * 1024 });
+const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
+const MAX_CONNS_PER_IP = 8;
+const wss = new WebSocket.Server({
+  port: PORT,
+  maxPayload: 1024 * 1024 * 1024,
+  perMessageDeflate: {
+    zlibDeflateOptions: { level: 6, memLevel: 8 },
+    zlibInflateOptions: { windowBits: 15 | 16 },
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    threshold: 1024
+  },
+  verifyClient: (info) => {
+    const ip = info.req.socket.remoteAddress || 'unknown';
+    let count = 0;
+    for (const [, ws] of peers) {
+      if (ws._socket && (ws._socket.remoteAddress || '') === ip) count++;
+    }
+    if (count >= MAX_CONNS_PER_IP) {
+      console.log(`[WARN] Too many connections from ${ip}`);
+      return false;
+    }
+    return true;
+  }
+});
 
 const peers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут – для очень больших файлов
+const HEARTBEAT_TIMEOUT = 600_000;
 
-// Приоритетная очередь для file‑available (отправляются без задержки)
+const rateLimits = new Map();
+function checkRateLimit(ws) {
+  const now = Date.now();
+  const window = 1000;
+  let entry = rateLimits.get(ws);
+  if (!entry) {
+    entry = { count: 1, start: now };
+    rateLimits.set(ws, entry);
+    return true;
+  }
+  if (now - entry.start > window) {
+    entry.count = 1;
+    entry.start = now;
+    return true;
+  }
+  if (entry.count >= 30) return false;
+  entry.count++;
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ws, entry] of rateLimits) {
+    if (now - entry.start > 5000) rateLimits.delete(ws);
+  }
+}, 10000);
+
 const priorityQueues = new Map();
 
 function send(ws, obj) {
@@ -164,8 +228,9 @@ function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
   heartbeats.set(peerId, setTimeout(() => { peers.get(peerId)?.close(); }, HEARTBEAT_TIMEOUT));
 }
-function enqueueEvent(recipientId, type, payload) {
-  return stmtInsertEvent.run(recipientId, type, JSON.stringify(payload), Date.now()).lastInsertRowid;
+function enqueueEvent(recipientId, type, payloadObj) {
+  const compressed = compressPayload(payloadObj);
+  return stmtInsertEvent.run(recipientId, type, compressed, Date.now()).lastInsertRowid;
 }
 
 // ─── Группы ──────────────────────────────────────────────────────────────────
@@ -192,13 +257,21 @@ function removeMember(groupId, peerId) {
 
 // ─── Соединения ──────────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
+  ws._socket.setTimeout(0);
+  ws._socket.setNoDelay(true);
+  ws._socket.setKeepAlive(true, 60000);
+
   let myId = null;
 
   ws.on('message', (raw) => {
+    if (!checkRateLimit(ws)) {
+      ws.close(4001, 'Rate limit exceeded');
+      return;
+    }
+
     let data;
     try { data = JSON.parse(raw); } catch { return; }
 
-    // ★ При ЛЮБОМ входящем сообщении продлеваем жизнь соединению
     if(myId) resetHeartbeat(myId);
 
     // ── Регистрация ──────────────────────────────────────────────────────────
@@ -213,10 +286,19 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Сначала шлём все накопленные приоритетные сообщения
       flushPriorityQueue(myId);
 
-      const events = stmtGetEvents.all(myId).map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
+      const rows = stmtGetEvents.all(myId);
+      const events = rows.map(r => {
+        try {
+          const payload = decompressPayload(r.payload);
+          return { id: r.id, type: r.type, payload };
+        } catch(e) {
+          console.error('[Event] Decompress error, deleting corrupted event:', r.id);
+          stmtDeleteEvent.run(r.id);
+          return null;
+        }
+      }).filter(Boolean);
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
       const pendingFiles = stmtGetPendingFiles.all(myId);
@@ -244,11 +326,11 @@ wss.on('connection', (ws) => {
     if(data.type === 'register-push') {
       if(!myId || !data.playerId) return;
       pushSubs[myId] = data.playerId;
-      fs.writeFileSync(pushFile, JSON.stringify(pushSubs));
+      try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
       return;
     }
 
-    // ── НОВЫЙ ТИП: подтверждение получения уведомления о файле ─────────────
+    // ── file‑available‑ack ────────────────────────────────────────────────
     if(data.type === 'file-available-ack') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
@@ -261,7 +343,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── ФАЙЛОВЫЙ ПРОТОКОЛ ────────────────────────────────────────────────────
+    // ── ФАЙЛОВЫЙ ПРОТОКОЛ ─────────────────────────────────────────────────
     if(data.type === 'store-file-header') {
       if(!myId) return;
       const recipient = (data.recipientId || '').toLowerCase();
@@ -271,7 +353,6 @@ wss.on('connection', (ws) => {
         data.mimeType, data.totalChunks, data.caption || '',
         data.ts || Date.now(), Date.now()
       );
-      console.log(`[File] Header stored: ${data.fileId} → ${recipient} (${data.name})`);
       send(ws, { type: 'store-file-header-ack', fileId: data.fileId });
       return;
     }
@@ -289,8 +370,6 @@ wss.on('connection', (ws) => {
       if(!header) return;
       const cnt = stmtCountChunks.get(data.fileId);
       if(cnt && cnt.cnt >= header.total_chunks) {
-        console.log(`[File] All chunks received: ${data.fileId}`);
-
         const payload = {
           fileId: data.fileId,
           senderId: myId,
@@ -302,18 +381,12 @@ wss.on('connection', (ws) => {
           ts: header.ts
         };
 
-        // Сохраняем в офлайн‑очередь
         const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
-
-        // Немедленная отправка получателю с приоритетом
         const recipientWs = peers.get(header.recipient_id);
         if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-          // Очищаем все накопившиеся приоритетные сообщения перед отправкой нового
           flushPriorityQueue(header.recipient_id);
-          // Отправляем file‑available немедленно
           send(recipientWs, { type: 'file-available', ...payload, eventId });
         } else {
-          // Если получатель офлайн – просто кладём в очередь, sendPush не даст затеряться
           const queue = priorityQueues.get(header.recipient_id) || [];
           queue.push({ type: 'file-available', ...payload, eventId });
           priorityQueues.set(header.recipient_id, queue);
@@ -363,7 +436,6 @@ wss.on('connection', (ws) => {
         ts: header.ts
       });
 
-      // ПОТОКОВАЯ ОТПРАВКА ЧАНКОВ
       const chunkIterator = db.prepare(
         `SELECT chunk_index, data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`
       ).iterate(data.fileId);
@@ -386,28 +458,25 @@ wss.on('connection', (ws) => {
             await new Promise(r => setTimeout(r, 0));
           }
         } catch (err) {
-          console.error(`[File] Stream error for ${data.fileId}:`, err);
+          console.error('[File] Stream error:', err);
         }
-        console.log(`[File] Finished streaming ${data.fileId} to ${myId}`);
       })();
 
       return;
     }
 
-    // Удаление после полной загрузки (подтверждение скачивания)
     if(data.type === 'ack-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
       if(header && (header.recipient_id === myId || header.sender_id === myId)) {
         stmtDeleteChunks.run(data.fileId);
         stmtDeleteHeader.run(data.fileId);
-        stmtDeleteFileAvail.run(myId, data.fileId);
-        console.log(`[File] Cleaned up after ack from ${myId}: ${data.fileId}`);
+        stmtDeleteFileAvail.run(myId, `%${data.fileId}%`);
       }
       return;
     }
 
-    // ── Обычные сообщения ────────────────────────────────────────────────────
+    // ── Обычные сообщения ─────────────────────────────────────────────────
     if(data.type === 'send-msg') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -439,12 +508,19 @@ wss.on('connection', (ws) => {
 
     if(data.type === 'ack-msg') {
       if(!myId) return;
-      const row = stmtAckMsg.get(myId, data.msgId);
-      if(row) {
-        stmtDeleteById.run(row.id);
-        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
-        const senderWs = peers.get(row.sender);
-        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId: data.msgId, by: myId, eventId });
+      const rows = db.prepare(`SELECT id, payload FROM events WHERE recipient_id=? AND type='incoming-msg'`).all(myId);
+      let foundId = null;
+      for (const row of rows) {
+        try {
+          const text = row.payload.toString('utf-8');
+          if (text.includes(`"msgId":"${data.msgId}"`)) {
+            foundId = row.id;
+            break;
+          }
+        } catch(e) { continue; }
+      }
+      if (foundId) {
+        stmtDeleteEvent.run(foundId);
       }
       return;
     }
@@ -470,7 +546,7 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // ── Группы ───────────────────────────────────────────────────────────────
+    // ── Группы ────────────────────────────────────────────────────────────
     if(data.type === 'create-group') {
       if(!myId) return;
       if(getGroupInvite(data.inviteCode) || getGroup(data.groupId)) {
@@ -574,8 +650,54 @@ wss.on('connection', (ws) => {
       if(peers.get(myId) === ws) { peers.delete(myId); broadcastPresence(myId, false); }
     }
   });
-  ws.on('error', (err) => console.error(`WS error [${myId}]:`, err.message));
+  ws.on('error', (err) => console.error('WS error:', err.message));
 });
+
+// ─── Health‑check /stats endpoint ────────────────────────────────────────────
+const STATS_TOKEN = process.env.STATS_TOKEN || '';
+const healthServer = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+  } else if (req.url === '/stats' && STATS_TOKEN) {
+    const auth = req.headers['authorization'] || '';
+    if (auth !== `Bearer ${STATS_TOKEN}`) {
+      res.writeHead(403);
+      return res.end('Forbidden');
+    }
+    const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM events').get().cnt;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      activeConnections: peers.size,
+      queuedEvents: eventCount
+    }));
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
+});
+healthServer.listen(HEALTH_PORT, () => {
+  console.log(`[Health] listening on port ${HEALTH_PORT}`);
+});
+
+// ─── Мониторинг (каждые 5 минут) ────────────────────────────────────────────
+setInterval(() => {
+  console.log(`[Stats] Active connections: ${peers.size}`);
+}, 5 * 60 * 1000);
+
+// ─── Graceful shutdown ─────────────────────────────────────────────────────────
+function gracefulShutdown() {
+  console.log('\n[Shutdown] closing all connections…');
+  for (const [, ws] of peers) {
+    try { ws.close(1001, 'Server restarting'); } catch(e) {}
+  }
+  try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
+  try { db.close(); } catch(e) {}
+  console.log('[Shutdown] done');
+  process.exit(0);
+}
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // ─── Самопинг ────────────────────────────────────────────────────────────────
 const APP_URL = 'https://signal-server-aipd.onrender.com';
