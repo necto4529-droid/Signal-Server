@@ -136,7 +136,7 @@ const wss = new WebSocket.Server({ port: PORT, maxPayload: 256 * 1024 * 1024 });
 
 const peers = new Map();
 const heartbeats = new Map();
-// ★ Увеличено до 5 минут – соединение не рвётся при передаче больших файлов
+// 5 минут — достаточно для передачи больших файлов
 const HEARTBEAT_TIMEOUT = 300_000;
 
 function send(ws, obj) {
@@ -335,10 +335,19 @@ wss.on('connection', (ws) => {
         ts: header.ts
       });
 
-      // ★ Отправка чанков с задержкой 25 мс — предотвращает переполнение буфера
+      // ★ Адаптивная отправка с контролем буфера (backpressure)
       (async () => {
+        const CHUNK_DELAY_MS = 0;      // базовая задержка — 0, шлём на максимальной скорости
+        const MAX_BUFFER = 256 * 1024;  // ждём, если в буфере больше 256 КБ
         for(const chunk of chunks) {
-          if(ws.readyState !== WebSocket.OPEN) break; // остановка, если сокет закрыт
+          if(ws.readyState !== WebSocket.OPEN) break;
+
+          // Пока буфер переполнен, ждём небольшими паузами
+          while(ws.bufferedAmount > MAX_BUFFER && ws.readyState === WebSocket.OPEN) {
+            await new Promise(r => setTimeout(r, 5));
+          }
+          if(ws.readyState !== WebSocket.OPEN) break;
+
           send(ws, {
             type: 'file-data-chunk',
             fileId: data.fileId,
@@ -346,7 +355,9 @@ wss.on('connection', (ws) => {
             total: header.total_chunks,
             data: chunk.data
           });
-          await new Promise(resolve => setTimeout(resolve, 25)); // пауза 25 мс
+
+          // Микро-пауза, чтобы дать сокету "выдохнуть" и не забивать event loop
+          if(CHUNK_DELAY_MS > 0) await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
         }
       })();
 
