@@ -135,11 +135,27 @@ const wss = new WebSocket.Server({ port: PORT, maxPayload: 256 * 1024 * 1024 });
 
 const peers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 300_000; // 5 минут
+const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут – для очень больших файлов
+
+// Приоритетная очередь для file‑available (отправляются без задержки)
+const priorityQueues = new Map();
 
 function send(ws, obj) {
   if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
+
+function flushPriorityQueue(userId) {
+  const ws = peers.get(userId);
+  if(!ws || ws.readyState !== WebSocket.OPEN) return;
+  const queue = priorityQueues.get(userId) || [];
+  while(queue.length > 0) {
+    const msg = queue.shift();
+    try { ws.send(JSON.stringify(msg)); } catch(e) { break; }
+  }
+  if(queue.length === 0) priorityQueues.delete(userId);
+  else priorityQueues.set(userId, queue);
+}
+
 function broadcastPresence(peerId, isOnline) {
   const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
   for(const [, ws] of peers) if(ws.readyState === WebSocket.OPEN) ws.send(msg);
@@ -196,6 +212,9 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
+
+      // Сначала шлём все накопленные приоритетные сообщения
+      flushPriorityQueue(myId);
 
       const events = stmtGetEvents.all(myId).map(r => ({ id: r.id, type: r.type, payload: JSON.parse(r.payload) }));
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
@@ -282,11 +301,22 @@ wss.on('connection', (ws) => {
           caption: header.caption,
           ts: header.ts
         };
+
+        // Сохраняем в офлайн‑очередь
         const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+
+        // Немедленная отправка получателю с приоритетом
         const recipientWs = peers.get(header.recipient_id);
-        if(recipientWs) {
+        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          // Очищаем все накопившиеся приоритетные сообщения перед отправкой нового
+          flushPriorityQueue(header.recipient_id);
+          // Отправляем file‑available немедленно
           send(recipientWs, { type: 'file-available', ...payload, eventId });
         } else {
+          // Если получатель офлайн – просто кладём в очередь, sendPush не даст затеряться
+          const queue = priorityQueues.get(header.recipient_id) || [];
+          queue.push({ type: 'file-available', ...payload, eventId });
+          priorityQueues.set(header.recipient_id, queue);
           sendPush(header.recipient_id, `📎 ${header.name}`).catch(() => {});
         }
 
@@ -358,7 +388,7 @@ wss.on('connection', (ws) => {
         } catch (err) {
           console.error(`[File] Stream error for ${data.fileId}:`, err);
         }
-        console.log(`[File] Finished streaming ${data.fileId}`);
+        console.log(`[File] Finished streaming ${data.fileId} to ${myId}`);
       })();
 
       return;
