@@ -4,11 +4,6 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
-const Redis = require('ioredis');
-
-// ─── Конфигурация ────────────────────────────────────────────────────────────
-const SERVER_ID = process.env.SERVER_ID || 'server-1';
-const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
 // ─── SQLite WAL ───────────────────────────────────────────────────────────────
 const dbPath = path.join(__dirname, 'offline_queue.db');
@@ -136,46 +131,13 @@ function cleanupOldFiles() {
 setInterval(cleanupOldFiles, 60 * 60 * 1000);
 cleanupOldFiles();
 
-// ─── Redis ────────────────────────────────────────────────────────────────────
-// Опции: быстрый фейл при недоступности, не зависаем навсегда
-const redis = new Redis(REDIS_URL, {
-  enableOfflineQueue: false,   // сразу ошибка вместо очереди при offline
-  lazyConnect: true,           // не коннектиться до первого вызова
-  maxRetriesPerRequest: 1,     // max 1 retry, потом ошибка
-  retryStrategy(times) {
-    if (times > 5) return null; // после 5 попыток — не переподключаться
-    return Math.min(times * 300, 3000);
-  },
-  connectTimeout: 5000,        // 5с таймаут на коннект
-});
-
-// Обязательно — иначе неперехваченная 'error' роняет процесс
-redis.on('error', err => {
-  console.error('[Redis] Connection error (non-fatal):', err.message);
-});
-redis.on('connect', () => console.log('[Redis] Connected'));
-redis.on('reconnecting', () => console.log('[Redis] Reconnecting...'));
-
-// Утилита: вызов Redis с таймаутом 2с и fallback-значением при ошибке
-async function redisCall(fn, fallback) {
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('Redis timeout')), 2000))
-    ]);
-  } catch(e) {
-    console.warn('[Redis] call failed, using fallback:', e.message);
-    return fallback;
-  }
-}
-
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
 const MAX_CONNS_PER_IP = 8;
 const wss = new WebSocket.Server({
   port: PORT,
-  maxPayload: 1024 * 1024 * 1024,
+  maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -192,13 +154,13 @@ const wss = new WebSocket.Server({
 
 const peers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 600_000;
+const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
 
-// Rate limiting
+// Rate limiting: не более 30 сообщений в секунду с одного подключения
 const rateLimits = new Map();
 function checkRateLimit(ws) {
   const now = Date.now();
-  const window = 1000;
+  const window = 1000; // 1 секунда
   let entry = rateLimits.get(ws);
   if (!entry) {
     entry = { count: 1, start: now };
@@ -222,51 +184,34 @@ setInterval(() => {
   }
 }, 10000);
 
-// Подписка на канал этого сервера
-redis.subscribe(`server:${SERVER_ID}`, (err, count) => {
-  if (err) console.error('[Redis] Subscribe error:', err);
-  else console.log(`[Redis] Subscribed to server:${SERVER_ID} (${count} channels)`);
-});
-
-redis.on('message', (channel, message) => {
-  if (channel === `server:${SERVER_ID}`) {
-    try {
-      const { targetId, ...msg } = JSON.parse(message);
-      const ws = peers.get(targetId);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(msg));
-      }
-    } catch(e) {}
-  }
-});
+const priorityQueues = new Map();
 
 function send(ws, obj) {
   if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+function flushPriorityQueue(userId) {
+  const ws = peers.get(userId);
+  if(!ws || ws.readyState !== WebSocket.OPEN) return;
+  const queue = priorityQueues.get(userId) || [];
+  while(queue.length > 0) {
+    const msg = queue.shift();
+    try { ws.send(JSON.stringify(msg)); } catch(e) { break; }
+  }
+  if(queue.length === 0) priorityQueues.delete(userId);
+  else priorityQueues.set(userId, queue);
 }
 
 function broadcastPresence(peerId, isOnline) {
   const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
   for(const [, ws] of peers) if(ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
-
 function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
   heartbeats.set(peerId, setTimeout(() => { peers.get(peerId)?.close(); }, HEARTBEAT_TIMEOUT));
 }
-
-async function enqueueEvent(recipientId, type, payloadObj) {
-  // redisCall с fallback=null: если Redis недоступен — считаем получателя офлайн
-  // и сохраняем в локальный SQLite (надёжный fallback)
-  const targetServer = await redisCall(() => redis.hget('peer:server', recipientId), null);
-  if (targetServer && targetServer !== SERVER_ID) {
-    // Получатель на другом сервере – шлём через pub/sub
-    redisCall(() => redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: recipientId, ...payloadObj, eventId: null })), null);
-    // Также сохраняем в SQLite как страховку (на случай если тот сервер тоже упал)
-    stmtInsertEvent.run(recipientId, type, JSON.stringify(payloadObj), Date.now());
-  } else {
-    // Офлайн или Redis недоступен – сохраняем в локальный SQLite
-    stmtInsertEvent.run(recipientId, type, JSON.stringify(payloadObj), Date.now());
-  }
+function enqueueEvent(recipientId, type, payload) {
+  return stmtInsertEvent.run(recipientId, type, JSON.stringify(payload), Date.now()).lastInsertRowid;
 }
 
 // ─── Группы ──────────────────────────────────────────────────────────────────
@@ -286,7 +231,6 @@ function addMember(groupId, peerId) {
   stmtUpdateGroupMbrs.run(JSON.stringify(members), groupId);
   return true;
 }
-
 function removeMember(groupId, peerId) {
   const g = getGroup(groupId); if(!g) return;
   stmtUpdateGroupMbrs.run(JSON.stringify(JSON.parse(g.members).filter(id => id !== peerId)), groupId);
@@ -300,7 +244,7 @@ wss.on('connection', (ws) => {
 
   let myId = null;
 
-  ws.on('message', async (raw) => {
+  ws.on('message', (raw) => {
     if (!checkRateLimit(ws)) {
       ws.close(4001, 'Rate limit exceeded');
       return;
@@ -323,19 +267,16 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Сохраняем в Redis (не блокируем если Redis недоступен)
-      await redisCall(() => redis.hset('peer:server', myId, SERVER_ID), null);
+      flushPriorityQueue(myId);
 
-      // Отправляем офлайн-сообщения из локальной очереди (этого сервера)
       const rows = stmtGetEvents.all(myId);
-      for (const r of rows) {
-        try {
-          const payload = JSON.parse(r.payload);
-          send(ws, { type: r.type, ...payload, eventId: r.id });
-        } catch(e) { stmtDeleteEvent.run(r.id); }
-      }
+      const events = rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        payload: JSON.parse(r.payload)
+      }));
+      for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
-      // Пендинг файлы
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
         const cnt = stmtCountChunks.get(h.file_id);
@@ -349,8 +290,7 @@ wss.on('connection', (ws) => {
             mimeType: h.mime_type,
             totalChunks: h.total_chunks,
             caption: h.caption,
-            ts: h.ts,
-            uploadServer: SERVER_ID
+            ts: h.ts
           });
         }
       }
@@ -372,7 +312,9 @@ wss.on('connection', (ws) => {
       const header = stmtGetHeader.get(data.fileId);
       if(header && header.recipient_id === myId) {
         const deliveryPayload = { fileId: data.fileId, by: myId };
-        await enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+        const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+        const senderWs = peers.get(header.sender_id);
+        if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
       }
       return;
     }
@@ -412,17 +354,19 @@ wss.on('connection', (ws) => {
           mimeType: header.mime_type,
           totalChunks: header.total_chunks,
           caption: header.caption,
-          ts: header.ts,
-          uploadServer: SERVER_ID
+          ts: header.ts
         };
 
-        const targetServer = await redisCall(() => redis.hget('peer:server', header.recipient_id), null);
-        if (targetServer) {
-          // Онлайн – отправляем через pub/sub
-          redisCall(() => redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: header.recipient_id, type: 'file-available', ...payload, eventId: null }));, null)
+        const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+        const recipientWs = peers.get(header.recipient_id);
+        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          flushPriorityQueue(header.recipient_id);
+          send(recipientWs, { type: 'file-available', ...payload, eventId });
         } else {
-          // Офлайн – сохраняем локально
-          stmtInsertEvent.run(header.recipient_id, 'file-available', JSON.stringify(payload), Date.now());
+          const queue = priorityQueues.get(header.recipient_id) || [];
+          queue.push({ type: 'file-available', ...payload, eventId });
+          priorityQueues.set(header.recipient_id, queue);
+          sendPush(header.recipient_id, `📎 ${header.name}`).catch(() => {});
         }
 
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
@@ -447,13 +391,30 @@ wss.on('connection', (ws) => {
       const totalChunks = header.total_chunks;
       const cnt = stmtCountChunks.get(data.fileId);
       if(!cnt || cnt.cnt < totalChunks) {
-        send(ws, { type: 'file-fetch-partial', fileId: data.fileId, received: cnt ? cnt.cnt : 0, total: totalChunks });
+        send(ws, {
+          type: 'file-fetch-partial',
+          fileId: data.fileId,
+          received: cnt ? cnt.cnt : 0,
+          total: totalChunks
+        });
         return;
       }
 
-      send(ws, { type: 'file-data-header', fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: totalChunks, caption: header.caption, ts: header.ts });
+      send(ws, {
+        type: 'file-data-header',
+        fileId: data.fileId,
+        senderId: header.sender_id,
+        name: header.name,
+        size: header.size,
+        mimeType: header.mime_type,
+        totalChunks: totalChunks,
+        caption: header.caption,
+        ts: header.ts
+      });
 
-      const chunkIterator = db.prepare(`SELECT chunk_index, data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).iterate(data.fileId);
+      const chunkIterator = db.prepare(
+        `SELECT chunk_index, data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`
+      ).iterate(data.fileId);
 
       (async () => {
         try {
@@ -463,11 +424,20 @@ wss.on('connection', (ws) => {
               await new Promise(r => setTimeout(r, 5));
             }
             if (ws.readyState !== WebSocket.OPEN) break;
-            send(ws, { type: 'file-data-chunk', fileId: data.fileId, index: chunk.chunk_index, total: totalChunks, data: chunk.data });
+            send(ws, {
+              type: 'file-data-chunk',
+              fileId: data.fileId,
+              index: chunk.chunk_index,
+              total: totalChunks,
+              data: chunk.data
+            });
             await new Promise(r => setTimeout(r, 0));
           }
-        } catch (err) { console.error('[File] Stream error:', err); }
+        } catch (err) {
+          console.error('[File] Stream error:', err);
+        }
       })();
+
       return;
     }
 
@@ -506,19 +476,8 @@ wss.on('connection', (ws) => {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
         if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
       } else {
-        const targetServer = await redisCall(() => redis.hget('peer:server', target), null);
-        if (targetServer) {
-          // На другом сервере – через pub/sub
-          redisCall(() => redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: target, type: 'incoming-msg', from: myId, msgId, payload }));, null)
-          if (!ephemeral) {
-            // Также кладём в офлайн-очередь (на случай если получатель отключится в этот момент)
-            redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: target, type: 'offline-msg', from: myId, msgId, payload }));
-          }
-        } else {
-          // Офлайн – сохраняем локально
-          if(!ephemeral) stmtInsertEvent.run(target, 'incoming-msg', JSON.stringify({ from: myId, msgId, payload }), Date.now());
-          sendPush(target, 'Новое сообщение').catch(() => {});
-        }
+        if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+        sendPush(target, 'Новое сообщение').catch(() => {});
       }
       return;
     }
@@ -528,7 +487,9 @@ wss.on('connection', (ws) => {
       const row = stmtAckMsg.get(myId, data.msgId);
       if(row) {
         stmtDeleteById.run(row.id);
-        enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
+        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
+        const senderWs = peers.get(row.sender);
+        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId: data.msgId, by: myId, eventId });
       }
       return;
     }
@@ -541,15 +502,16 @@ wss.on('connection', (ws) => {
     if(data.type === 'query-presence') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const online = peers.has(target) || (await redisCall(() => redis.hget('peer:server', target), null)) !== null;
-      send(ws, { type: 'presence-reply', target, online });
+      send(ws, { type: 'presence-reply', target, online: peers.has(target) });
       return;
     }
 
     if(data.type === 'voice-listened') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
+      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
+      const tw = peers.get(target);
+      if(tw) send(tw, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
       return;
     }
 
@@ -650,28 +612,25 @@ wss.on('connection', (ws) => {
     }
   });
 
-  ws.on('close', async () => {
+  ws.on('close', () => {
     if(myId) {
       clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
-      if(peers.get(myId) === ws) {
-        peers.delete(myId);
-        broadcastPresence(myId, false);
-        await redisCall(() => redis.hdel('peer:server', myId), null);
-      }
+      if(peers.get(myId) === ws) { peers.delete(myId); broadcastPresence(myId, false); }
     }
   });
   ws.on('error', (err) => console.error('WS error:', err.message));
 });
 
 // ─── Health‑check /stats endpoint ────────────────────────────────────────────
+const STATS_TOKEN = process.env.STATS_TOKEN || '';
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
-  } else if (req.url === '/stats' && process.env.STATS_TOKEN) {
+  } else if (req.url === '/stats' && STATS_TOKEN) {
     const auth = req.headers['authorization'] || '';
-    if (auth !== `Bearer ${process.env.STATS_TOKEN}`) {
+    if (auth !== `Bearer ${STATS_TOKEN}`) {
       res.writeHead(403);
       return res.end('Forbidden');
     }
@@ -702,7 +661,6 @@ function gracefulShutdown() {
     try { ws.close(1001, 'Server restarting'); } catch(e) {}
   }
   try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
-  redis.disconnect();
   try { db.close(); } catch(e) {}
   console.log('[Shutdown] done');
   process.exit(0);
@@ -710,20 +668,11 @@ function gracefulShutdown() {
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
 
-// ─── Самопинг на все пять серверов ───────────────────────────────────────────
-const PING_URLS = [
-  'https://signal-server-aipd.onrender.com',
-  'https://signal-server-1-47iv.onrender.com',
-  'https://signal-server-2-1skn.onrender.com',
-  'https://signal-server-3-moev.onrender.com',
-  'https://signal-server-4-ve7m.onrender.com'
-];
-
+// ─── Самопинг ────────────────────────────────────────────────────────────────
+const APP_URL = 'https://signal-server-aipd.onrender.com';
 setInterval(() => {
-  PING_URLS.forEach(url => {
-    https.get(url, res => console.log(`[Self-Ping] ${url} → ${res.statusCode}`))
-         .on('error', err => console.error(`[Self-Ping] ${url} → Error: ${err.message}`));
-  });
+  https.get(APP_URL, res => console.log(`[Self-Ping] ${res.statusCode}`))
+       .on('error', err => console.error(`[Self-Ping] Error: ${err.message}`));
 }, 4 * 60 * 1000);
 
-console.log(`[K-Chat server] ${SERVER_ID} ready on port ${PORT}`);
+console.log(`[K-Chat server] ready on port ${PORT}`);
