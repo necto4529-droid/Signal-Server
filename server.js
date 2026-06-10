@@ -137,7 +137,37 @@ setInterval(cleanupOldFiles, 60 * 60 * 1000);
 cleanupOldFiles();
 
 // ─── Redis ────────────────────────────────────────────────────────────────────
-const redis = new Redis(REDIS_URL);
+// Опции: быстрый фейл при недоступности, не зависаем навсегда
+const redis = new Redis(REDIS_URL, {
+  enableOfflineQueue: false,   // сразу ошибка вместо очереди при offline
+  lazyConnect: true,           // не коннектиться до первого вызова
+  maxRetriesPerRequest: 1,     // max 1 retry, потом ошибка
+  retryStrategy(times) {
+    if (times > 5) return null; // после 5 попыток — не переподключаться
+    return Math.min(times * 300, 3000);
+  },
+  connectTimeout: 5000,        // 5с таймаут на коннект
+});
+
+// Обязательно — иначе неперехваченная 'error' роняет процесс
+redis.on('error', err => {
+  console.error('[Redis] Connection error (non-fatal):', err.message);
+});
+redis.on('connect', () => console.log('[Redis] Connected'));
+redis.on('reconnecting', () => console.log('[Redis] Reconnecting...'));
+
+// Утилита: вызов Redis с таймаутом 2с и fallback-значением при ошибке
+async function redisCall(fn, fallback) {
+  try {
+    return await Promise.race([
+      fn(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Redis timeout')), 2000))
+    ]);
+  } catch(e) {
+    console.warn('[Redis] call failed, using fallback:', e.message);
+    return fallback;
+  }
+}
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
@@ -225,15 +255,18 @@ function resetHeartbeat(peerId) {
 }
 
 async function enqueueEvent(recipientId, type, payloadObj) {
-  const targetServer = await redis.hget('peer:server', recipientId);
+  // redisCall с fallback=null: если Redis недоступен — считаем получателя офлайн
+  // и сохраняем в локальный SQLite (надёжный fallback)
+  const targetServer = await redisCall(() => redis.hget('peer:server', recipientId), null);
   if (targetServer && targetServer !== SERVER_ID) {
-    // Получатель на другом сервере – шлём через pub/sub, не сохраняем локально
-    redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: recipientId, ...payloadObj, eventId: null }));
-  } else if (!targetServer) {
-    // Офлайн – сохраняем в локальный SQLite
+    // Получатель на другом сервере – шлём через pub/sub
+    redisCall(() => redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: recipientId, ...payloadObj, eventId: null })), null);
+    // Также сохраняем в SQLite как страховку (на случай если тот сервер тоже упал)
+    stmtInsertEvent.run(recipientId, type, JSON.stringify(payloadObj), Date.now());
+  } else {
+    // Офлайн или Redis недоступен – сохраняем в локальный SQLite
     stmtInsertEvent.run(recipientId, type, JSON.stringify(payloadObj), Date.now());
   }
-  // Если на этом же сервере – ничего не делаем, сообщение уже доставлено через send()
 }
 
 // ─── Группы ──────────────────────────────────────────────────────────────────
@@ -290,8 +323,8 @@ wss.on('connection', (ws) => {
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
 
-      // Сохраняем в Redis
-      await redis.hset('peer:server', myId, SERVER_ID);
+      // Сохраняем в Redis (не блокируем если Redis недоступен)
+      await redisCall(() => redis.hset('peer:server', myId, SERVER_ID), null);
 
       // Отправляем офлайн-сообщения из локальной очереди (этого сервера)
       const rows = stmtGetEvents.all(myId);
@@ -383,10 +416,10 @@ wss.on('connection', (ws) => {
           uploadServer: SERVER_ID
         };
 
-        const targetServer = await redis.hget('peer:server', header.recipient_id);
+        const targetServer = await redisCall(() => redis.hget('peer:server', header.recipient_id), null);
         if (targetServer) {
           // Онлайн – отправляем через pub/sub
-          redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: header.recipient_id, type: 'file-available', ...payload, eventId: null }));
+          redisCall(() => redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: header.recipient_id, type: 'file-available', ...payload, eventId: null }));, null)
         } else {
           // Офлайн – сохраняем локально
           stmtInsertEvent.run(header.recipient_id, 'file-available', JSON.stringify(payload), Date.now());
@@ -473,10 +506,10 @@ wss.on('connection', (ws) => {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
         if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
       } else {
-        const targetServer = await redis.hget('peer:server', target);
+        const targetServer = await redisCall(() => redis.hget('peer:server', target), null);
         if (targetServer) {
           // На другом сервере – через pub/sub
-          redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: target, type: 'incoming-msg', from: myId, msgId, payload }));
+          redisCall(() => redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: target, type: 'incoming-msg', from: myId, msgId, payload }));, null)
           if (!ephemeral) {
             // Также кладём в офлайн-очередь (на случай если получатель отключится в этот момент)
             redis.publish(`server:${targetServer}`, JSON.stringify({ targetId: target, type: 'offline-msg', from: myId, msgId, payload }));
@@ -508,7 +541,7 @@ wss.on('connection', (ws) => {
     if(data.type === 'query-presence') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const online = peers.has(target) || (await redis.hget('peer:server', target)) !== null;
+      const online = peers.has(target) || (await redisCall(() => redis.hget('peer:server', target), null)) !== null;
       send(ws, { type: 'presence-reply', target, online });
       return;
     }
@@ -624,7 +657,7 @@ wss.on('connection', (ws) => {
       if(peers.get(myId) === ws) {
         peers.delete(myId);
         broadcastPresence(myId, false);
-        await redis.hdel('peer:server', myId);
+        await redisCall(() => redis.hdel('peer:server', myId), null);
       }
     }
   });
