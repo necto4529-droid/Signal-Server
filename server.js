@@ -506,12 +506,33 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── voice-listened: получатель прослушал голосовое ────────────────────
+    // Сервер пересылает сигнал отправителю и ставит его в очередь
+    // на случай если отправитель сейчас офлайн.
     if(data.type === 'voice-listened') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
       const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
       const tw = peers.get(target);
       if(tw) send(tw, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
+      return;
+    }
+
+    // ── vn-watched: получатель просмотрел видео-кружок ────────────────────
+    // Аналог voice-listened, но для video_note.
+    // Клиент отправляет: { type:'vn-watched', target: senderPeerId, vnMsgId: '...' }
+    // Сервер:
+    //   1) Ставит событие 'vn-watched' в очередь для отправителя (offline-устойчивость)
+    //   2) Если отправитель онлайн — немедленно пересылает ему
+    //   3) Возвращает eventId чтобы клиент мог ack-event после получения
+    if(data.type === 'vn-watched') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      if(!target || !data.vnMsgId) return;
+      const eventPayload = { from: myId, vnMsgId: data.vnMsgId };
+      const eventId = enqueueEvent(target, 'vn-watched', eventPayload);
+      const tw = peers.get(target);
+      if(tw) send(tw, { type: 'vn-watched', from: myId, vnMsgId: data.vnMsgId, eventId });
       return;
     }
 
