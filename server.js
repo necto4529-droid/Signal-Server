@@ -57,16 +57,6 @@ db.exec(`
     PRIMARY KEY (file_id, chunk_index)
   );
   CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks (file_id);
-
-  CREATE TABLE IF NOT EXISTS x3dh_keys (
-    peer_id    TEXT PRIMARY KEY,
-    ik_pub     TEXT NOT NULL,
-    spk_pub    TEXT NOT NULL,
-    spk_sig    TEXT NOT NULL,
-    spk_id     TEXT NOT NULL,
-    opks       TEXT NOT NULL DEFAULT '[]',
-    updated_at INTEGER NOT NULL
-  );
 `);
 
 // ─── Подготовленные запросы ───────────────────────────────────────────────────
@@ -101,36 +91,6 @@ const stmtDeleteFileAvail = db.prepare(`
   WHERE recipient_id=? AND type='file-available'
     AND json_extract(payload,'$.fileId')=?
 `);
-
-// ─── X3DH prepared statements ─────────────────────────────────────────────────
-const stmtUpsertX3DHKeys = db.prepare(`
-  INSERT OR REPLACE INTO x3dh_keys (peer_id, ik_pub, spk_pub, spk_sig, spk_id, opks, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?, ?)
-`);
-const stmtGetX3DHKeys    = db.prepare(`SELECT * FROM x3dh_keys WHERE peer_id=?`);
-const stmtAddOPKs        = db.prepare(`UPDATE x3dh_keys SET opks=?, updated_at=? WHERE peer_id=?`);
-const stmtGetOPKs        = db.prepare(`SELECT opks FROM x3dh_keys WHERE peer_id=?`);
-
-function getX3DHBundle(peerId) {
-  const row = stmtGetX3DHKeys.get(peerId);
-  if(!row) return null;
-  let opks = [];
-  try { opks = JSON.parse(row.opks || '[]'); } catch(e) {}
-  // Берём первый OPK и убираем его из списка (one-time!)
-  let opk = null;
-  if(opks.length > 0) {
-    opk = opks[0];
-    const remaining = opks.slice(1);
-    stmtAddOPKs.run(JSON.stringify(remaining), Date.now(), peerId);
-  }
-  return {
-    ikPub:  row.ik_pub,
-    spkPub: row.spk_pub,
-    spkSig: row.spk_sig,
-    spkId:  row.spk_id,
-    opk:    opk || null,
-  };
-}
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
 const pushFile = path.join(__dirname, 'push_subscriptions.json');
@@ -671,68 +631,7 @@ wss.on('connection', (ws) => {
       const tw = peers.get(data.target.toLowerCase());
       if(tw) send(tw, { type: 'signal', from: myId, payload: data.payload });
     }
-
-    // ── X3DH: публикация ключей ───────────────────────────────────────────
-    if(data.type === 'x3dh-publish-keys') {
-      if(!myId) return;
-      const { ikPub, spkPub, spkSig, spkId, opks } = data;
-      if(!ikPub || !spkPub || !spkId) return;
-
-      // Сохраняем/обновляем ключи пользователя
-      const existing = stmtGetX3DHKeys.get(myId);
-      let existingOpks = [];
-      if(existing) {
-        try { existingOpks = JSON.parse(existing.opks || '[]'); } catch(e) {}
-      }
-
-      // Добавляем новые OPKs к существующим
-      const newOpks = Array.isArray(opks) ? opks : [];
-      const allOpks = [...existingOpks, ...newOpks];
-
-      stmtUpsertX3DHKeys.run(
-        myId, ikPub, spkPub, spkSig || '', spkId,
-        JSON.stringify(allOpks), Date.now()
-      );
-
-      send(ws, { type: 'x3dh-keys-published' });
-      return;
-    }
-
-    // ── X3DH: запрос bundle другого пользователя ──────────────────────────
-    if(data.type === 'x3dh-fetch-bundle') {
-      if(!myId) return;
-      const target = (data.target || '').toLowerCase();
-      if(!target) return;
-      const bundle = getX3DHBundle(target);
-      send(ws, { type: 'x3dh-bundle-reply', target, bundle: bundle || null });
-      return;
-    }
-
-    // ── X3DH: первое зашифрованное сообщение (handshake + ciphertext) ─────
-    if(data.type === 'x3dh-init-msg') {
-      if(!myId) return;
-      const target = (data.target || '').toLowerCase();
-      if(!target || !data.ciphertext) return;
-
-      const payload = {
-        from:       myId,
-        msgId:      data.msgId,
-        initHeader: data.initHeader,
-        ciphertext: data.ciphertext,
-      };
-
-      const targetWs = peers.get(target);
-      if(targetWs && targetWs.readyState === WebSocket.OPEN) {
-        send(targetWs, { type: 'x3dh-init-msg', ...payload });
-      } else {
-        // Получатель офлайн — сохраняем в очередь событий
-        enqueueEvent(target, 'x3dh-init-msg', payload);
-        sendPush(target, 'Новое зашифрованное сообщение').catch(() => {});
-      }
-      return;
-    }
-
-  }); // end ws.on('message')
+  });
 
   ws.on('close', () => {
     if(myId) {
