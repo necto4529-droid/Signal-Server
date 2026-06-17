@@ -12,7 +12,7 @@ db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
 db.pragma('cache_size = -16000');
 db.pragma('temp_store = MEMORY');
-db.pragma('mmap_size = 268435456');
+db.pragma('mmap_size = 268435456'); // 256 МБ memory-mapped I/O
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS events (
@@ -57,30 +57,6 @@ db.exec(`
     PRIMARY KEY (file_id, chunk_index)
   );
   CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks (file_id);
-
-  -- ═══════════════════════════════════════════════════════════════════
-  -- X3DH KEY STORE
-  -- identity_key  — долгосрочный публичный ключ (IK, ECDH P-256)
-  -- signed_prekey — среднесрочный подписанный prekey (SPK)
-  -- one_time_prekeys — массив OPK (JSON-список), расходуются по одному
-  -- ═══════════════════════════════════════════════════════════════════
-  CREATE TABLE IF NOT EXISTS x3dh_identity (
-    peer_id       TEXT PRIMARY KEY,
-    ik_pub        TEXT NOT NULL,
-    spk_pub       TEXT NOT NULL,
-    spk_sig       TEXT NOT NULL,
-    spk_id        TEXT NOT NULL,
-    updated_at    INTEGER NOT NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS x3dh_one_time_prekeys (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    peer_id     TEXT NOT NULL,
-    opk_id      TEXT NOT NULL,
-    opk_pub     TEXT NOT NULL,
-    created_at  INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_opk_peer ON x3dh_one_time_prekeys (peer_id);
 `);
 
 // ─── Подготовленные запросы ───────────────────────────────────────────────────
@@ -109,28 +85,12 @@ const stmtCountChunks     = db.prepare(`SELECT COUNT(*) as cnt FROM file_chunks 
 const stmtDeleteChunks    = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`);
 const stmtDeleteHeader    = db.prepare(`DELETE FROM file_headers WHERE file_id=?`);
 const stmtGetPendingFiles = db.prepare(`SELECT * FROM file_headers WHERE recipient_id=?`);
+
 const stmtDeleteFileAvail = db.prepare(`
   DELETE FROM events
   WHERE recipient_id=? AND type='file-available'
     AND json_extract(payload,'$.fileId')=?
 `);
-
-// ─── X3DH prepared statements ─────────────────────────────────────────────────
-const stmtUpsertIdentity = db.prepare(`
-  INSERT OR REPLACE INTO x3dh_identity (peer_id, ik_pub, spk_pub, spk_sig, spk_id, updated_at)
-  VALUES (?, ?, ?, ?, ?, ?)
-`);
-const stmtGetIdentity    = db.prepare(`SELECT * FROM x3dh_identity WHERE peer_id=?`);
-const stmtInsertOPK      = db.prepare(`
-  INSERT INTO x3dh_one_time_prekeys (peer_id, opk_id, opk_pub, created_at)
-  VALUES (?, ?, ?, ?)
-`);
-const stmtCountOPK       = db.prepare(`SELECT COUNT(*) as cnt FROM x3dh_one_time_prekeys WHERE peer_id=?`);
-const stmtPopOPK         = db.prepare(`
-  SELECT * FROM x3dh_one_time_prekeys WHERE peer_id=? ORDER BY id LIMIT 1
-`);
-const stmtDeleteOPK      = db.prepare(`DELETE FROM x3dh_one_time_prekeys WHERE id=?`);
-const stmtDeleteAllOPK   = db.prepare(`DELETE FROM x3dh_one_time_prekeys WHERE peer_id=?`);
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
 const pushFile = path.join(__dirname, 'push_subscriptions.json');
@@ -177,7 +137,7 @@ const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
 const MAX_CONNS_PER_IP = 8;
 const wss = new WebSocket.Server({
   port: PORT,
-  maxPayload: 1024 * 1024 * 1024,
+  maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -194,19 +154,29 @@ const wss = new WebSocket.Server({
 
 const peers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 600_000;
+const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
 
+// Rate limiting: не более 30 сообщений в секунду с одного подключения
 const rateLimits = new Map();
 function checkRateLimit(ws) {
   const now = Date.now();
-  const window = 1000;
+  const window = 1000; // 1 секунда
   let entry = rateLimits.get(ws);
-  if (!entry) { entry = { count: 1, start: now }; rateLimits.set(ws, entry); return true; }
-  if (now - entry.start > window) { entry.count = 1; entry.start = now; return true; }
+  if (!entry) {
+    entry = { count: 1, start: now };
+    rateLimits.set(ws, entry);
+    return true;
+  }
+  if (now - entry.start > window) {
+    entry.count = 1;
+    entry.start = now;
+    return true;
+  }
   if (entry.count >= 30) return false;
   entry.count++;
   return true;
 }
+
 setInterval(() => {
   const now = Date.now();
   for (const [ws, entry] of rateLimits) {
@@ -275,9 +245,14 @@ wss.on('connection', (ws) => {
   let myId = null;
 
   ws.on('message', (raw) => {
-    if (!checkRateLimit(ws)) { ws.close(4001, 'Rate limit exceeded'); return; }
+    if (!checkRateLimit(ws)) {
+      ws.close(4001, 'Rate limit exceeded');
+      return;
+    }
+
     let data;
     try { data = JSON.parse(raw); } catch { return; }
+
     if(myId) resetHeartbeat(myId);
 
     // ── Регистрация ──────────────────────────────────────────────────────────
@@ -291,13 +266,16 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
+
       flushPriorityQueue(myId);
 
       const rows = stmtGetEvents.all(myId);
-      for(const r of rows) {
-        const ev = JSON.parse(r.payload);
-        send(ws, { type: r.type, ...ev, eventId: r.id });
-      }
+      const events = rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        payload: JSON.parse(r.payload)
+      }));
+      for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
@@ -305,10 +283,14 @@ wss.on('connection', (ws) => {
         if(cnt && cnt.cnt >= h.total_chunks) {
           send(ws, {
             type: 'file-available',
-            fileId: h.file_id, senderId: h.sender_id,
-            name: h.name, size: h.size,
-            mimeType: h.mime_type, totalChunks: h.total_chunks,
-            caption: h.caption, ts: h.ts
+            fileId: h.file_id,
+            senderId: h.sender_id,
+            name: h.name,
+            size: h.size,
+            mimeType: h.mime_type,
+            totalChunks: h.total_chunks,
+            caption: h.caption,
+            ts: h.ts
           });
         }
       }
@@ -321,88 +303,6 @@ wss.on('connection', (ws) => {
       if(!myId || !data.playerId) return;
       pushSubs[myId] = data.playerId;
       try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
-      return;
-    }
-
-    // ════════════════════════════════════════════════════════════════
-    // X3DH KEY EXCHANGE PROTOCOL
-    // ════════════════════════════════════════════════════════════════
-
-    // Клиент публикует свои ключи на сервере
-    if(data.type === 'x3dh-publish-keys') {
-      if(!myId) return;
-      const { ikPub, spkPub, spkSig, spkId, opks } = data;
-      if(!ikPub || !spkPub || !spkSig || !spkId) return;
-
-      // Сохраняем identity + signed prekey
-      stmtUpsertIdentity.run(myId, ikPub, spkPub, spkSig, spkId, Date.now());
-
-      // Добавляем одноразовые prekeys (не более 100)
-      if(Array.isArray(opks) && opks.length > 0) {
-        const current = stmtCountOPK.get(myId);
-        const canAdd = Math.min(opks.length, 100 - (current ? current.cnt : 0));
-        for(let i = 0; i < canAdd; i++) {
-          const opk = opks[i];
-          if(opk && opk.id && opk.pub) {
-            stmtInsertOPK.run(myId, opk.id, opk.pub, Date.now());
-          }
-        }
-      }
-      send(ws, { type: 'x3dh-keys-published' });
-      return;
-    }
-
-    // Клиент запрашивает prekey bundle собеседника для начала X3DH
-    if(data.type === 'x3dh-fetch-bundle') {
-      if(!myId) return;
-      const targetId = (data.target || '').toLowerCase();
-      if(!targetId) return;
-
-      const identity = stmtGetIdentity.get(targetId);
-      if(!identity) {
-        send(ws, { type: 'x3dh-bundle-reply', target: targetId, bundle: null });
-        return;
-      }
-
-      // Берём одну OPK (расходуем)
-      const opkRow = stmtPopOPK.get(targetId);
-      let opk = null;
-      if(opkRow) {
-        opk = { id: opkRow.opk_id, pub: opkRow.opk_pub };
-        stmtDeleteOPK.run(opkRow.id);
-      }
-
-      const bundle = {
-        ikPub:  identity.ik_pub,
-        spkPub: identity.spk_pub,
-        spkSig: identity.spk_sig,
-        spkId:  identity.spk_id,
-        opk,           // null если OPK закончились (допустимо по протоколу)
-      };
-      send(ws, { type: 'x3dh-bundle-reply', target: targetId, bundle });
-      return;
-    }
-
-    // X3DH Initial Message: пересылаем получателю как событие
-    if(data.type === 'x3dh-init-msg') {
-      if(!myId) return;
-      const targetId = (data.target || '').toLowerCase();
-      if(!targetId || !data.initHeader || !data.ciphertext) return;
-
-      const payload = {
-        from:       myId,
-        initHeader: data.initHeader,   // {ekPub, ikPub, spkId, opkId}
-        ciphertext: data.ciphertext,   // первое зашифрованное сообщение
-        msgId:      data.msgId,
-      };
-
-      const eventId = enqueueEvent(targetId, 'x3dh-init-msg', payload);
-      const targetWs = peers.get(targetId);
-      if(targetWs) {
-        send(targetWs, { type: 'x3dh-init-msg', ...payload, eventId });
-      } else {
-        sendPush(targetId, 'Новое сообщение').catch(() => {});
-      }
       return;
     }
 
@@ -437,19 +337,26 @@ wss.on('connection', (ws) => {
       if(!myId) return;
       const chunks = data.chunks;
       if(!Array.isArray(chunks)) return;
+
       for(const chunk of chunks) {
         stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
       }
+
       const header = stmtGetHeader.get(data.fileId);
       if(!header) return;
       const cnt = stmtCountChunks.get(data.fileId);
       if(cnt && cnt.cnt >= header.total_chunks) {
         const payload = {
-          fileId: data.fileId, senderId: myId,
-          name: header.name, size: header.size,
-          mimeType: header.mime_type, totalChunks: header.total_chunks,
-          caption: header.caption, ts: header.ts
+          fileId: data.fileId,
+          senderId: myId,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          ts: header.ts
         };
+
         const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
         const recipientWs = peers.get(header.recipient_id);
         if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
@@ -461,6 +368,7 @@ wss.on('connection', (ws) => {
           priorityQueues.set(header.recipient_id, queue);
           sendPush(header.recipient_id, `📎 ${header.name}`).catch(() => {});
         }
+
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
       } else {
         send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
@@ -471,25 +379,43 @@ wss.on('connection', (ws) => {
     if(data.type === 'fetch-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
-      if(!header) { send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Файл не найден на сервере' }); return; }
-      if(header.recipient_id !== myId && header.sender_id !== myId) {
-        send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Нет доступа' }); return;
+      if(!header) {
+        send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Файл не найден на сервере' });
+        return;
       }
+      if(header.recipient_id !== myId && header.sender_id !== myId) {
+        send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Нет доступа' });
+        return;
+      }
+
       const totalChunks = header.total_chunks;
       const cnt = stmtCountChunks.get(data.fileId);
       if(!cnt || cnt.cnt < totalChunks) {
-        send(ws, { type: 'file-fetch-partial', fileId: data.fileId, received: cnt ? cnt.cnt : 0, total: totalChunks });
+        send(ws, {
+          type: 'file-fetch-partial',
+          fileId: data.fileId,
+          received: cnt ? cnt.cnt : 0,
+          total: totalChunks
+        });
         return;
       }
+
       send(ws, {
-        type: 'file-data-header', fileId: data.fileId,
-        senderId: header.sender_id, name: header.name,
-        size: header.size, mimeType: header.mime_type,
-        totalChunks, caption: header.caption, ts: header.ts
+        type: 'file-data-header',
+        fileId: data.fileId,
+        senderId: header.sender_id,
+        name: header.name,
+        size: header.size,
+        mimeType: header.mime_type,
+        totalChunks: totalChunks,
+        caption: header.caption,
+        ts: header.ts
       });
+
       const chunkIterator = db.prepare(
         `SELECT chunk_index, data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`
       ).iterate(data.fileId);
+
       (async () => {
         try {
           for (const chunk of chunkIterator) {
@@ -498,11 +424,20 @@ wss.on('connection', (ws) => {
               await new Promise(r => setTimeout(r, 5));
             }
             if (ws.readyState !== WebSocket.OPEN) break;
-            send(ws, { type: 'file-data-chunk', fileId: data.fileId, index: chunk.chunk_index, total: totalChunks, data: chunk.data });
+            send(ws, {
+              type: 'file-data-chunk',
+              fileId: data.fileId,
+              index: chunk.chunk_index,
+              total: totalChunks,
+              data: chunk.data
+            });
             await new Promise(r => setTimeout(r, 0));
           }
-        } catch (err) { console.error('[File] Stream error:', err); }
+        } catch (err) {
+          console.error('[File] Stream error:', err);
+        }
       })();
+
       return;
     }
 
@@ -523,6 +458,7 @@ wss.on('connection', (ws) => {
       const target = (data.target || '').toLowerCase();
       const { msgId, payload, ephemeral } = data;
       if(!target || !msgId || !payload) return;
+
       if(target.startsWith('grp_')) {
         const g = getGroup(target); if(!g) return;
         JSON.parse(g.members).forEach(mid => {
@@ -534,6 +470,7 @@ wss.on('connection', (ws) => {
         });
         return;
       }
+
       const targetWs = peers.get(target);
       if(targetWs) {
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
@@ -569,6 +506,9 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── voice-listened: получатель прослушал голосовое ────────────────────
+    // Сервер пересылает сигнал отправителю и ставит его в очередь
+    // на случай если отправитель сейчас офлайн.
     if(data.type === 'voice-listened') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -578,11 +518,19 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── vn-watched: получатель просмотрел видео-кружок ────────────────────
+    // Аналог voice-listened, но для video_note.
+    // Клиент отправляет: { type:'vn-watched', target: senderPeerId, vnMsgId: '...' }
+    // Сервер:
+    //   1) Ставит событие 'vn-watched' в очередь для отправителя (offline-устойчивость)
+    //   2) Если отправитель онлайн — немедленно пересылает ему
+    //   3) Возвращает eventId чтобы клиент мог ack-event после получения
     if(data.type === 'vn-watched') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
       if(!target || !data.vnMsgId) return;
-      const eventId = enqueueEvent(target, 'vn-watched', { from: myId, vnMsgId: data.vnMsgId });
+      const eventPayload = { from: myId, vnMsgId: data.vnMsgId };
+      const eventId = enqueueEvent(target, 'vn-watched', eventPayload);
       const tw = peers.get(target);
       if(tw) send(tw, { type: 'vn-watched', from: myId, vnMsgId: data.vnMsgId, eventId });
       return;
@@ -695,7 +643,7 @@ wss.on('connection', (ws) => {
   ws.on('error', (err) => console.error('WS error:', err.message));
 });
 
-// ─── Health‑check ─────────────────────────────────────────────────────────────
+// ─── Health‑check /stats endpoint ────────────────────────────────────────────
 const STATS_TOKEN = process.env.STATS_TOKEN || '';
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health') {
@@ -703,21 +651,36 @@ const healthServer = http.createServer((req, res) => {
     res.end('OK');
   } else if (req.url === '/stats' && STATS_TOKEN) {
     const auth = req.headers['authorization'] || '';
-    if (auth !== `Bearer ${STATS_TOKEN}`) { res.writeHead(403); return res.end('Forbidden'); }
+    if (auth !== `Bearer ${STATS_TOKEN}`) {
+      res.writeHead(403);
+      return res.end('Forbidden');
+    }
     const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM events').get().cnt;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ activeConnections: peers.size, queuedEvents: eventCount }));
+    res.end(JSON.stringify({
+      activeConnections: peers.size,
+      queuedEvents: eventCount
+    }));
   } else {
-    res.writeHead(404); res.end();
+    res.writeHead(404);
+    res.end();
   }
 });
-healthServer.listen(HEALTH_PORT, () => { console.log(`[Health] listening on port ${HEALTH_PORT}`); });
+healthServer.listen(HEALTH_PORT, () => {
+  console.log(`[Health] listening on port ${HEALTH_PORT}`);
+});
 
-setInterval(() => { console.log(`[Stats] Active connections: ${peers.size}`); }, 5 * 60 * 1000);
+// ─── Мониторинг (каждые 5 минут) ────────────────────────────────────────────
+setInterval(() => {
+  console.log(`[Stats] Active connections: ${peers.size}`);
+}, 5 * 60 * 1000);
 
+// ─── Graceful shutdown ─────────────────────────────────────────────────────────
 function gracefulShutdown() {
   console.log('\n[Shutdown] closing all connections…');
-  for (const [, ws] of peers) { try { ws.close(1001, 'Server restarting'); } catch(e) {} }
+  for (const [, ws] of peers) {
+    try { ws.close(1001, 'Server restarting'); } catch(e) {}
+  }
   try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
   try { db.close(); } catch(e) {}
   console.log('[Shutdown] done');
@@ -726,6 +689,7 @@ function gracefulShutdown() {
 process.on('SIGTERM', gracefulShutdown);
 process.on('SIGINT', gracefulShutdown);
 
+// ─── Самопинг ────────────────────────────────────────────────────────────────
 const APP_URL = 'https://signal-server-aipd.onrender.com';
 setInterval(() => {
   https.get(APP_URL, res => console.log(`[Self-Ping] ${res.statusCode}`))
