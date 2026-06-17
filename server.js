@@ -383,21 +383,17 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // Инициатор отправляет X3DH Initial Message получателю
-    // (зашифрованное первое сообщение + ephemeral pub key для получателя)
+    // X3DH Initial Message: пересылаем получателю как событие
     if(data.type === 'x3dh-init-msg') {
       if(!myId) return;
       const targetId = (data.target || '').toLowerCase();
-      if(!targetId) return;
+      if(!targetId || !data.initHeader || !data.ciphertext) return;
 
       const payload = {
-        from:        myId,
-        ekPub:       data.ekPub,     // ephemeral public key отправителя
-        ikPub:       data.ikPub,     // identity public key отправителя
-        spkId:       data.spkId,     // какой SPK использовался
-        opkId:       data.opkId,     // какой OPK использовался (или null)
-        ciphertext:  data.ciphertext, // первое зашифрованное сообщение
-        msgId:       data.msgId,
+        from:       myId,
+        initHeader: data.initHeader,   // {ekPub, ikPub, spkId, opkId}
+        ciphertext: data.ciphertext,   // первое зашифрованное сообщение
+        msgId:      data.msgId,
       };
 
       const eventId = enqueueEvent(targetId, 'x3dh-init-msg', payload);
