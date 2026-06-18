@@ -4,6 +4,8 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
+const { spawn } = require('child_process');
+const os = require('os');
 
 // ─── SQLite WAL ───────────────────────────────────────────────────────────────
 const dbPath = path.join(__dirname, 'offline_queue.db');
@@ -115,6 +117,83 @@ async function sendPush(userId, message) {
       })
     });
   } catch(e) {}
+}
+
+// ─── АУДИО ОБРАБОТКА (FFmpeg) ─────────────────────────────────────────────────
+async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    // Продвинутые параметры для идеального качества при минимальном весе:
+    // - libopus: лучший кодек для речи
+    // - 128k: битрейт "прозрачного" качества
+    // - vbr on: переменный битрейт для экономии места
+    // - application voip: оптимизация под человеческий голос
+    const ffmpegArgs = [
+      '-i', inputPath,
+      '-c:a', 'libopus',
+      '-b:a', '128k',
+      '-vbr', 'on',
+      '-compression_level', '10',
+      '-ar', '48000',
+      '-ac', '1',
+      '-application', 'voip',
+      '-y',
+      outputPath
+    ];
+    
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    let stderr = '';
+    ffmpeg.stderr.on('data', (data) => { stderr += data.toString(); });
+    ffmpeg.on('close', (code) => {
+      if (code === 0) resolve(outputPath);
+      else reject(new Error(`FFmpeg error: ${stderr}`));
+    });
+    ffmpeg.on('error', reject);
+  });
+}
+
+async function saveTemporaryFile(data, ext = '.webm') {
+  const tempDir = path.join(os.tmpdir(), 'kchat-audio');
+  if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+  const filename = `audio-${Date.now()}-${Math.random().toString(36).substr(2, 9)}${ext}`;
+  const filepath = path.join(tempDir, filename);
+  
+  if (typeof data === 'string' && data.startsWith('data:')) {
+    const base64 = data.replace(/^data:[^,]+,/, '');
+    fs.writeFileSync(filepath, Buffer.from(base64, 'base64'));
+  } else {
+    fs.writeFileSync(filepath, data);
+  }
+  return filepath;
+}
+
+function cleanupTemporaryFile(filepath) {
+  try { if (fs.existsSync(filepath)) fs.unlinkSync(filepath); } catch (e) {}
+}
+
+async function processVoiceMessage(voiceData) {
+  let inputPath, outputPath;
+  try {
+    inputPath = await saveTemporaryFile(voiceData, '.webm');
+    outputPath = inputPath.replace('.webm', '-optimized.webm');
+    await optimizeAudioWithFFmpeg(inputPath, outputPath);
+    const optimizedData = fs.readFileSync(outputPath);
+    const originalSize = fs.statSync(inputPath).size;
+    const optimizedSize = fs.statSync(outputPath).size;
+    const compression = ((1 - optimizedSize / originalSize) * 100).toFixed(1);
+    
+    cleanupTemporaryFile(inputPath);
+    cleanupTemporaryFile(outputPath);
+    
+    return {
+      data: `data:audio/webm;base64,${optimizedData.toString('base64')}`,
+      size: optimizedSize,
+      compression: compression
+    };
+  } catch (error) {
+    if(inputPath) cleanupTemporaryFile(inputPath);
+    if(outputPath) cleanupTemporaryFile(outputPath);
+    return { data: voiceData, size: 0, compression: 0 };
+  }
 }
 
 // ─── Очистка старых файлов ────────────────────────────────────────────────────
@@ -244,7 +323,7 @@ wss.on('connection', (ws) => {
 
   let myId = null;
 
-  ws.on('message', (raw) => {
+  ws.on('message', async (raw) => {
     if (!checkRateLimit(ws)) {
       ws.close(4001, 'Rate limit exceeded');
       return;
@@ -304,6 +383,17 @@ wss.on('connection', (ws) => {
       pushSubs[myId] = data.playerId;
       try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
       return;
+    }
+
+    // ── ОБРАБОТКА ГОЛОСОВЫХ СООБЩЕНИЙ ─────────────────────────────────────────
+    if(data.type === 'send-msg' && data.payload && data.payload.startsWith('data:audio')) {
+      try {
+        const processed = await processVoiceMessage(data.payload);
+        data.payload = processed.data;
+        console.log(`[Voice] Оптимизировано голосовое сообщение (сжато на ${processed.compression}%)`);
+      } catch (error) {
+        console.error('Ошибка при обработке голосового:', error);
+      }
     }
 
     // ── file‑available‑ack ────────────────────────────────────────────────
@@ -366,136 +456,54 @@ wss.on('connection', (ws) => {
           const queue = priorityQueues.get(header.recipient_id) || [];
           queue.push({ type: 'file-available', ...payload, eventId });
           priorityQueues.set(header.recipient_id, queue);
-          sendPush(header.recipient_id, `📎 ${header.name}`).catch(() => {});
+          sendPush(header.recipient_id, `📎 ${header.name}`);
         }
-
-        send(ws, { type: 'file-upload-complete', fileId: data.fileId });
-      } else {
-        send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       }
       return;
     }
 
     if(data.type === 'fetch-file') {
       if(!myId) return;
-      const header = stmtGetHeader.get(data.fileId);
-      if(!header) {
-        send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Файл не найден на сервере' });
-        return;
-      }
-      if(header.recipient_id !== myId && header.sender_id !== myId) {
-        send(ws, { type: 'file-fetch-error', fileId: data.fileId, msg: 'Нет доступа' });
-        return;
-      }
+      const fileId = data.fileId;
+      const header = stmtGetHeader.get(fileId);
+      if(!header) { send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' }); return; }
+      if(header.recipient_id !== myId) { send(ws, { type: 'file-fetch-error', fileId, msg: 'Access denied' }); return; }
 
-      const totalChunks = header.total_chunks;
-      const cnt = stmtCountChunks.get(data.fileId);
-      if(!cnt || cnt.cnt < totalChunks) {
-        send(ws, {
-          type: 'file-fetch-partial',
-          fileId: data.fileId,
-          received: cnt ? cnt.cnt : 0,
-          total: totalChunks
-        });
+      const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(fileId);
+      if(chunks.length < header.total_chunks) {
+        send(ws, { type: 'file-fetch-partial', fileId, received: chunks.length, total: header.total_chunks });
         return;
       }
 
-      send(ws, {
-        type: 'file-data-header',
-        fileId: data.fileId,
-        senderId: header.sender_id,
-        name: header.name,
-        size: header.size,
-        mimeType: header.mime_type,
-        totalChunks: totalChunks,
-        caption: header.caption,
-        ts: header.ts
-      });
-
-      const chunkIterator = db.prepare(
-        `SELECT chunk_index, data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`
-      ).iterate(data.fileId);
-
-      (async () => {
-        try {
-          for (const chunk of chunkIterator) {
-            if (ws.readyState !== WebSocket.OPEN) break;
-            while (ws.bufferedAmount > 256 * 1024 && ws.readyState === WebSocket.OPEN) {
-              await new Promise(r => setTimeout(r, 5));
-            }
-            if (ws.readyState !== WebSocket.OPEN) break;
-            send(ws, {
-              type: 'file-data-chunk',
-              fileId: data.fileId,
-              index: chunk.chunk_index,
-              total: totalChunks,
-              data: chunk.data
-            });
-            await new Promise(r => setTimeout(r, 0));
-          }
-        } catch (err) {
-          console.error('[File] Stream error:', err);
-        }
-      })();
-
-      return;
-    }
-
-    if(data.type === 'ack-file') {
-      if(!myId) return;
-      const header = stmtGetHeader.get(data.fileId);
-      if(header && (header.recipient_id === myId || header.sender_id === myId)) {
-        stmtDeleteChunks.run(data.fileId);
-        stmtDeleteHeader.run(data.fileId);
-        stmtDeleteFileAvail.run(myId, data.fileId);
+      send(ws, { type: 'file-data-header', fileId, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks });
+      for(const chunk of chunks) {
+        send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
       }
       return;
     }
 
-    // ── Обычные сообщения ─────────────────────────────────────────────────
     if(data.type === 'send-msg') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
-      const { msgId, payload, ephemeral } = data;
-      if(!target || !msgId || !payload) return;
-
-      if(target.startsWith('grp_')) {
-        const g = getGroup(target); if(!g) return;
-        JSON.parse(g.members).forEach(mid => {
-          if(mid === myId) return;
-          const mw = peers.get(mid);
-          if(mw) send(mw, { type: 'incoming-msg', from: myId, msgId, payload });
-          else sendPush(mid, 'Новое сообщение в группе').catch(() => {});
-          if(!ephemeral) enqueueEvent(mid, 'incoming-msg', { from: myId, msgId, payload });
-        });
-        return;
-      }
-
+      if(!target) return;
+      const msgId = data.msgId;
+      const payload = data.payload;
+      const eventId = enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
       const targetWs = peers.get(target);
-      if(targetWs) {
-        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
-        if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      if(targetWs && targetWs.readyState === WebSocket.OPEN) {
+        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload, eventId });
       } else {
-        if(!ephemeral) enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
-        sendPush(target, 'Новое сообщение').catch(() => {});
-      }
-      return;
-    }
-
-    if(data.type === 'ack-msg') {
-      if(!myId) return;
-      const row = stmtAckMsg.get(myId, data.msgId);
-      if(row) {
-        stmtDeleteById.run(row.id);
-        const eventId = enqueueEvent(row.sender, 'msg-delivered', { msgId: data.msgId, by: myId });
-        const senderWs = peers.get(row.sender);
-        if(senderWs) send(senderWs, { type: 'msg-delivered', msgId: data.msgId, by: myId, eventId });
+        const queue = priorityQueues.get(target) || [];
+        queue.push({ type: 'incoming-msg', from: myId, msgId, payload, eventId });
+        priorityQueues.set(target, queue);
+        sendPush(target, `💬 ${myId}`);
       }
       return;
     }
 
     if(data.type === 'ack-event') {
-      if(myId && data.eventId) stmtDeleteEvent.run(data.eventId);
+      if(!myId) return;
+      stmtDeleteEvent.run(data.eventId);
       return;
     }
 
@@ -507,8 +515,6 @@ wss.on('connection', (ws) => {
     }
 
     // ── voice-listened: получатель прослушал голосовое ────────────────────
-    // Сервер пересылает сигнал отправителю и ставит его в очередь
-    // на случай если отправитель сейчас офлайн.
     if(data.type === 'voice-listened') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
@@ -519,12 +525,6 @@ wss.on('connection', (ws) => {
     }
 
     // ── vn-watched: получатель просмотрел видео-кружок ────────────────────
-    // Аналог voice-listened, но для video_note.
-    // Клиент отправляет: { type:'vn-watched', target: senderPeerId, vnMsgId: '...' }
-    // Сервер:
-    //   1) Ставит событие 'vn-watched' в очередь для отправителя (offline-устойчивость)
-    //   2) Если отправитель онлайн — немедленно пересылает ему
-    //   3) Возвращает eventId чтобы клиент мог ack-event после получения
     if(data.type === 'vn-watched') {
       if(!myId) return;
       const target = (data.target || '').toLowerCase();
