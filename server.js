@@ -635,6 +635,24 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    // ── ack-msg: получатель реально открыл чат / увидел сообщение ───────────
+    // Находим исходное incoming-msg событие в офлайн-очереди, удаляем его и
+    // отправляем отправителю msg-delivered. Именно это двигает 1 галочку → ✔✔.
+    if(data.type === 'ack-msg') {
+      if(!myId || !data.msgId) return;
+      const row = stmtAckMsg.get(myId, data.msgId);
+      if(!row) return;
+      stmtDeleteById.run(row.id);
+      if(!row.sender) return;
+      const deliveryPayload = { msgId: data.msgId, by: myId };
+      const deliveredEventId = enqueueEvent(row.sender, 'msg-delivered', deliveryPayload);
+      const senderWs = peers.get(row.sender);
+      if(senderWs && senderWs.readyState === WebSocket.OPEN) {
+        send(senderWs, { type: 'msg-delivered', ...deliveryPayload, eventId: deliveredEventId });
+      }
+      return;
+    }
+
     if(data.type === 'ack-event') {
       if(!myId) return;
       stmtDeleteEvent.run(data.eventId);
