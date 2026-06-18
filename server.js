@@ -136,6 +136,7 @@ async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
       '-ar', '48000',
       '-ac', '1',
       '-application', 'voip',
+      '-filter_complex', 'afftdn=nr=20:nf=-20:rn=0.01:rf=0.01,adeclick,acompressor=ratio=4:attack=20:release=200:threshold=-20:detection=peak,loudnorm',
       '-y',
       outputPath
     ];
