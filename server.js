@@ -183,7 +183,7 @@ async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
       '-b:a', '128k',
       '-ar', '48000',
       '-ac', '1',
-      '-filter:v', 'scale=640:640:force_original_aspect_ratio=increase,crop=640:640', // Квадрат для кружка
+      '-filter:v', 'fps=fps=30:round=near,scale=640:640:force_original_aspect_ratio=increase,crop=640:640', // Жесткая стабилизация FPS и квадрат для кружка
       '-y',
       outputPath
     ];
