@@ -158,7 +158,7 @@ async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
     const ffmpegArgs = [
       '-i', inputPath,
       '-c:v', 'libvpx-vp9',
-      '-crf', '30',
+      '-crf', '35', // Увеличиваем CRF для уменьшения размера файла (больше сжатия)
       '-b:v', '0',
       '-deadline', 'good',
       '-cpu-used', '4',
