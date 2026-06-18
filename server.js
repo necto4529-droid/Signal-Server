@@ -3,6 +3,8 @@ const http = require('http');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const zlib = require('zlib');
+const sharp = require('sharp');
 const https = require('https');
 const { spawn } = require('child_process');
 const os = require('os');
@@ -45,7 +47,8 @@ db.exec(`
     size         INTEGER NOT NULL,
     mime_type    TEXT NOT NULL,
     total_chunks INTEGER NOT NULL,
-    caption      TEXT DEFAULT '',
+    compressed   INTEGER DEFAULT 0 NOT NULL,
+    caption      TEXT DEFAULT \'\',
     ts           INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
   );
@@ -54,7 +57,8 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS file_chunks (
     file_id     TEXT NOT NULL,
     chunk_index INTEGER NOT NULL,
-    data        TEXT NOT NULL,
+    data        BLOB NOT NULL,
+    compressed  INTEGER DEFAULT 0 NOT NULL,
     created_at  INTEGER NOT NULL,
     PRIMARY KEY (file_id, chunk_index)
   );
@@ -75,12 +79,12 @@ const stmtDeleteById      = db.prepare(`DELETE FROM events WHERE id=?`);
 
 const stmtInsertHeader    = db.prepare(`
   INSERT OR REPLACE INTO file_headers
-    (file_id, sender_id, recipient_id, name, size, mime_type, total_chunks, caption, ts, created_at)
-  VALUES (?,?,?,?,?,?,?,?,?,?)
+    (file_id, sender_id, recipient_id, name, size, mime_type, total_chunks, compressed, caption, ts, created_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?)
 `);
 const stmtInsertChunk     = db.prepare(`
-  INSERT OR REPLACE INTO file_chunks (file_id, chunk_index, data, created_at)
-  VALUES (?,?,?,?)
+  INSERT OR REPLACE INTO file_chunks (file_id, chunk_index, data, compressed, created_at)
+  VALUES (?,?,?,?,?)
 `);
 const stmtGetHeader       = db.prepare(`SELECT * FROM file_headers WHERE file_id=?`);
 const stmtCountChunks     = db.prepare(`SELECT COUNT(*) as cnt FROM file_chunks WHERE file_id=?`);
@@ -144,6 +148,38 @@ async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
     });
     ffmpeg.on('error', reject);
   });
+}
+
+async function optimizeImage(inputBuffer, mimeType) {
+  try {
+    let image = sharp(inputBuffer);
+    const metadata = await image.metadata();
+
+    // Максимальный размер для изображений (например, 1280px по большей стороне)
+    const MAX_IMAGE_DIMENSION = 1280;
+
+    if (metadata.width > MAX_IMAGE_DIMENSION || metadata.height > MAX_IMAGE_DIMENSION) {
+      image = image.resize(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION, { fit: sharp.fit.inside, withoutEnlargement: true });
+    }
+
+    // Оптимизация в зависимости от типа
+    if (mimeType === 'image/jpeg') {
+      image = image.jpeg({ quality: 80, progressive: true });
+    } else if (mimeType === 'image/png') {
+      image = image.png({ compressionLevel: 9, adaptiveFiltering: true });
+    } else if (mimeType === 'image/webp') {
+      image = image.webp({ quality: 80 });
+    }
+    // Для других типов (gif, svg) пока не оптимизируем, возвращаем оригинал
+    if (['image/gif', 'image/svg+xml'].includes(mimeType)) {
+      return inputBuffer;
+    }
+
+    return await image.toBuffer();
+  } catch (e) {
+    console.error('[Image Optimize] Error:', e);
+    return inputBuffer; // В случае ошибки возвращаем оригинал
+  }
 }
 
 async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
@@ -370,7 +406,7 @@ wss.on('connection', (ws) => {
 
   let myId = null;
 
-  ws.on('message', async (raw) => {
+  ws.on('message', async (message) => {
     if (!checkRateLimit(ws)) {
       ws.close(4001, 'Rate limit exceeded');
       return;
@@ -463,7 +499,7 @@ wss.on('connection', (ws) => {
       if(!recipient) return;
       stmtInsertHeader.run(
         data.fileId, myId, recipient, data.name, data.size,
-        data.mimeType, data.totalChunks, data.caption || '',
+        data.mimeType, data.totalChunks, 0, data.caption || 
         data.ts || Date.now(), Date.now()
       );
       send(ws, { type: 'store-file-header-ack', fileId: data.fileId });
@@ -475,93 +511,122 @@ wss.on('connection', (ws) => {
       const chunks = data.chunks;
       if(!Array.isArray(chunks)) return;
 
-      for(const chunk of chunks) {
-        stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
+      let isCompressed = 0;
+      let isImage = false;
+      let isText = false;
+
+      // Определяем тип файла для оптимизации/сжатия
+      if (header.mime_type.startsWith("image/") && !header.name.includes("__vnote__")) {
+        isImage = true;
+      } else if (["text/plain", "application/json", "text/html", "text/css", "text/javascript"].includes(header.mime_type)) {
+        isText = true;
+      }
+
+      if (isImage) {
+        const rawBuffer = Buffer.concat(chunks.map(c => Buffer.from(c.data, 'base64')));
+        const optimizedBuffer = await optimizeImage(rawBuffer, header.mime_type);
+        const newTotalChunks = Math.ceil(optimizedBuffer.length / (256 * 1024));
+
+        db.transaction(() => {
+          stmtDeleteChunks.run(data.fileId);
+          db.prepare(`UPDATE file_headers SET size=?, total_chunks=?, compressed=? WHERE file_id=?`).run(optimizedBuffer.length, newTotalChunks, 0, data.fileId);
+          for (let i = 0; i < newTotalChunks; i++) {
+            const start = i * (256 * 1024);
+            const chunk = optimizedBuffer.slice(start, start + (256 * 1024));
+            stmtInsertChunk.run(data.fileId, i, chunk.toString('base64'), 0, Date.now()); // 0 = not compressed, as sharp handles compression
+          }
+        })();
+      } else if (isText) {
+        for(const chunk of chunks) {
+          const compressedData = zlib.gzipSync(Buffer.from(chunk.data, 'base64'));
+          stmtInsertChunk.run(data.fileId, chunk.index, compressedData.toString('base64'), 1, Date.now());
+        }
+        isCompressed = 1;
+      } else {
+        for(const chunk of chunks) {
+          stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, 0, Date.now());
+        }
       }
 
       const header = stmtGetHeader.get(data.fileId);
       if(!header) return;
       const cnt = stmtCountChunks.get(data.fileId);
       if(cnt && cnt.cnt >= header.total_chunks) {
+        let finalPayload = null;
+        let inputPath = null;
+        let outputPath = null;
+
         // ── Пост-обработка видео-кружков на сервере ──
         if (header.name.includes('__vnote__')) {
-          (async () => {
-            let inputPath, outputPath;
-            try {
-              const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(data.fileId);
-              const buffer = Buffer.concat(chunks.map(c => Buffer.from(c.data, 'base64')));
-              inputPath = await saveTemporaryFile(buffer, '.webm');
-              outputPath = inputPath.replace('.webm', '-optimized.webm');
-              
-              await optimizeVideoWithFFmpeg(inputPath, outputPath);
-              
-              const optimizedData = fs.readFileSync(outputPath);
-              const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024)); // Используем CHUNK_SIZE из клиента
-              
-              // Обновляем хедер и чанки
-              db.transaction(() => {
-                stmtDeleteChunks.run(data.fileId);
-                db.prepare(`UPDATE file_headers SET size=?, total_chunks=? WHERE file_id=?`).run(optimizedData.length, newTotalChunks, data.fileId);
-                for (let i = 0; i < newTotalChunks; i++) {
-                  const start = i * (256 * 1024);
-                  const chunk = optimizedData.slice(start, start + (256 * 1024));
-                  stmtInsertChunk.run(data.fileId, i, chunk.toString('base64'), Date.now());
-                }
-              })();
-              
-              const updatedHeader = stmtGetHeader.get(data.fileId);
-              const payload = {
-                fileId: data.fileId,
-                senderId: header.sender_id,
-                name: updatedHeader.name,
-                size: updatedHeader.size,
-                mimeType: updatedHeader.mime_type,
-                totalChunks: updatedHeader.total_chunks,
-                caption: updatedHeader.caption,
-                ts: updatedHeader.ts
-              };
-              
-              const eventId = enqueueEvent(updatedHeader.recipient_id, 'file-available', payload);
-              const recipientWs = peers.get(updatedHeader.recipient_id);
-              if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-                send(recipientWs, { type: 'file-available', ...payload, eventId });
+          try {
+            const rawChunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(data.fileId);
+            const buffer = Buffer.concat(rawChunks.map(c => Buffer.from(c.data, 'base64')));
+            inputPath = await saveTemporaryFile(buffer, '.webm');
+            outputPath = inputPath.replace('.webm', '-optimized.mp4'); // Изменяем расширение на mp4
+            
+            await optimizeVideoWithFFmpeg(inputPath, outputPath);
+            
+            const optimizedData = fs.readFileSync(outputPath);
+            const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024)); // Используем CHUNK_SIZE из клиента
+
+            // Обновляем хедер и чанки
+            db.transaction(() => {
+              stmtDeleteChunks.run(data.fileId);
+              db.prepare(`UPDATE file_headers SET size=?, total_chunks=?, mime_type=?, compressed=? WHERE file_id=?`).run(optimizedData.length, newTotalChunks, 'video/mp4', 0, data.fileId);
+              for (let i = 0; i < newTotalChunks; i++) {
+                const start = i * (256 * 1024);
+                const chunk = optimizedData.slice(start, start + (256 * 1024));
+                stmtInsertChunk.run(data.fileId, i, chunk.toString(\'base64\'), 0, Date.now());
               }
-            } catch (e) {
-              console.error('[VN-Optimize] Error:', e);
-              // Если ошибка — отправляем как есть
-              const payload = { fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, caption: header.caption, ts: header.ts };
-              const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
-              const recipientWs = peers.get(header.recipient_id);
-              if(recipientWs && recipientWs.readyState === WebSocket.OPEN) send(recipientWs, { type: 'file-available', ...payload, eventId });
-            } finally {
-              cleanupTemporaryFile(inputPath);
-              cleanupTemporaryFile(outputPath);
-            }
-          })();
-          return;
+            })();
+            
+            const updatedHeader = stmtGetHeader.get(data.fileId);
+            finalPayload = {
+              fileId: data.fileId,
+              senderId: header.sender_id,
+              name: updatedHeader.name,
+              size: updatedHeader.size,
+              mimeType: updatedHeader.mime_type,
+              totalChunks: updatedHeader.total_chunks,
+              caption: updatedHeader.caption,
+              ts: updatedHeader.ts
+            };
+            
+          } catch (e) {
+            console.error('[VN-Optimize] Error:', e);
+            // Если ошибка — отправляем как есть (оригинальный файл)
+            finalPayload = { fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, caption: header.caption, ts: header.ts };
+          } finally {
+            cleanupTemporaryFile(inputPath);
+            cleanupTemporaryFile(outputPath);
+          }
+        } else { // Для обычных файлов и голосовых сообщений
+          finalPayload = {
+            fileId: data.fileId,
+            senderId: myId,
+            name: header.name,
+            size: header.size,
+            mimeType: header.mime_type,
+            totalChunks: header.total_chunks,
+            compressed: isCompressed,
+            caption: header.caption,
+            ts: header.ts
+          };
         }
 
-        const payload = {
-          fileId: data.fileId,
-          senderId: myId,
-          name: header.name,
-          size: header.size,
-          mimeType: header.mime_type,
-          totalChunks: header.total_chunks,
-          caption: header.caption,
-          ts: header.ts
-        };
-
-        const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
-        const recipientWs = peers.get(header.recipient_id);
-        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-          flushPriorityQueue(header.recipient_id);
-          send(recipientWs, { type: 'file-available', ...payload, eventId });
-        } else {
-          const queue = priorityQueues.get(header.recipient_id) || [];
-          queue.push({ type: 'file-available', ...payload, eventId });
-          priorityQueues.set(header.recipient_id, queue);
-          sendPush(header.recipient_id, `📎 ${header.name}`);
+        // Отправляем file-available только после завершения всех операций
+        if (finalPayload) {
+          const eventId = enqueueEvent(header.recipient_id, 'file-available', finalPayload);
+          const recipientWs = peers.get(header.recipient_id);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            flushPriorityQueue(header.recipient_id);
+            send(recipientWs, { type: 'file-available', ...finalPayload, eventId });
+          } else {
+            const queue = priorityQueues.get(header.recipient_id) || [];
+            queue.push({ type: 'file-available', ...finalPayload, eventId });
+            priorityQueues.set(header.recipient_id, queue);
+            sendPush(header.recipient_id, `📎 ${header.name}`);
+          }
         }
       }
       return;
@@ -580,9 +645,13 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      send(ws, { type: 'file-data-header', fileId, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks });
+      send(ws, { type: 'file-data-header', fileId, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, compressed: header.compressed });
       for(const chunk of chunks) {
-        send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
+        let chunkData = chunk.data;
+        if (header.compressed) {
+          chunkData = zlib.gunzipSync(Buffer.from(chunk.data, 'base64')).toString('base64');
+        }
+        send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunkData });
       }
       return;
     }
