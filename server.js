@@ -122,24 +122,25 @@ async function sendPush(userId, message) {
 // ─── АУДИО ОБРАБОТКА (FFmpeg) ─────────────────────────────────────────────────
 async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    // ── СТУДИЙНОЕ КАЧЕСТВО (Telegram/Fury-уровень) ──
-    // - libopus: лучший кодек для речи
-    // - 192k: студийный битрейт (практически без потерь качества)
-    // - vbr on: переменный битрейт для экономии места
-    // - application audio: режим Music/Studio (сохраняет весь тембр голоса)
-    const ffmpegArgs = [
-      '-i', inputPath,
-      '-c:a', 'libopus',
-      '-b:a', '192k', // Студийное качество (192-256kbps)
-      '-vbr', 'on',
-      '-compression_level', '10',
-      '-ar', '48000',
-      '-ac', '1',
-      '-application', 'audio', // 'audio' (music) вместо 'voip' для сохранения всех нюансов тембра
-      '-filter_complex', 'afftdn=nr=10:nf=-15:rn=0.01:rf=0.01,adeclick,acompressor=ratio=3:attack=5:release=50:threshold=-15:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11', // Более мягкая фильтрация, чтобы не портить "кристальность"
-      '-y',
-      outputPath
-    ];
+          // ── СТУДИЙНОЕ КАЧЕСТВО (Telegram/Fury-уровень) ──
+      // - libopus: лучший кодек для речи
+      // - 192k: студийный битрейт (практически без потерь качества)
+      // - vbr on: переменный битрейт для экономии места
+      // - application audio: режим Music/Studio (сохраняет весь тембр голоса)
+      const ffmpegArgs = [
+        '-i', inputPath,
+        '-c:a', 'libopus',
+        '-b:a', '192k', // Студийное качество (192-256kbps)
+        '-vbr', 'on',
+        '-compression_level', '10',
+        '-ar', '48000',
+        '-ac', '1',
+        '-application', 'audio', // 'audio' (music) вместо 'voip' для сохранения всех нюансов тембра
+        // Уменьшаем шумоподавление и компрессию для более "открытого" звука
+        '-filter_complex', 'afftdn=nr=5:nf=-20:rn=0.005:rf=0.005,adeclick,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11', // Еще более мягкая фильтрация
+        '-y',
+        outputPath
+      ];
     
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     let stderr = '';
