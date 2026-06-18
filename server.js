@@ -122,26 +122,55 @@ async function sendPush(userId, message) {
 // ─── АУДИО ОБРАБОТКА (FFmpeg) ─────────────────────────────────────────────────
 async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-          // ── СТУДИЙНОЕ КАЧЕСТВО (Telegram/Fury-уровень) ──
-      // - libopus: лучший кодек для речи
-      // - 192k: студийный битрейт (практически без потерь качества)
-      // - vbr on: переменный битрейт для экономии места
-      // - application audio: режим Music/Studio (сохраняет весь тембр голоса)
       const ffmpegArgs = [
         '-i', inputPath,
         '-c:a', 'libopus',
-        '-b:a', '192k', // Студийное качество (192-256kbps)
+        '-b:a', '192k',
         '-vbr', 'on',
         '-compression_level', '10',
         '-ar', '48000',
         '-ac', '1',
-        '-application', 'audio', // 'audio' (music) вместо 'voip' для сохранения всех нюансов тембра
-        // Уменьшаем шумоподавление и компрессию для более "открытого" звука
-        '-filter_complex', 'afftdn=nr=5:nf=-20:rn=0.005:rf=0.005,adeclick,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11', // Еще более мягкая фильтрация
+        '-application', 'audio',
+        '-filter_complex', 'afftdn=nr=5:nf=-20:rn=0.005:rf=0.005,adeclick,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11',
         '-y',
         outputPath
       ];
-    
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs);
+    let stderr = '';
+    ffmpeg.stderr.on('data', (data) => { stderr += data.toString(); });
+    ffmpeg.on('close', (code) => {
+      if (code === 0) resolve(outputPath);
+      else reject(new Error(`FFmpeg error: ${stderr}`));
+    });
+    ffmpeg.on('error', reject);
+  });
+}
+
+async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    // ── КИНЕМАТОГРАФИЧНАЯ ПЛАВНОСТЬ (Telegram-уровень) ──
+    // - libvpx-vp9: отличный баланс качества и веса
+    // - -crf 30: хорошее качество при малом размере
+    // - -b:v 0: обязателен для CRF в VP9
+    // - -deadline good: баланс скорости и качества
+    // - -cpu-used 4: ускорение кодирования
+    // - -r 30: принудительно 30 FPS для плавности
+    const ffmpegArgs = [
+      '-i', inputPath,
+      '-c:v', 'libvpx-vp9',
+      '-crf', '30',
+      '-b:v', '0',
+      '-deadline', 'good',
+      '-cpu-used', '4',
+      '-r', '30',
+      '-c:a', 'libopus',
+      '-b:a', '128k',
+      '-ar', '48000',
+      '-ac', '1',
+      '-filter:v', 'scale=640:640:force_original_aspect_ratio=increase,crop=640:640', // Квадрат для кружка
+      '-y',
+      outputPath
+    ];
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     let stderr = '';
     ffmpeg.stderr.on('data', (data) => { stderr += data.toString(); });
@@ -438,6 +467,64 @@ wss.on('connection', (ws) => {
       if(!header) return;
       const cnt = stmtCountChunks.get(data.fileId);
       if(cnt && cnt.cnt >= header.total_chunks) {
+        // ── Пост-обработка видео-кружков на сервере ──
+        if (header.name.includes('__vnote__')) {
+          (async () => {
+            let inputPath, outputPath;
+            try {
+              const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(data.fileId);
+              const buffer = Buffer.concat(chunks.map(c => Buffer.from(c.data, 'base64')));
+              inputPath = await saveTemporaryFile(buffer, '.webm');
+              outputPath = inputPath.replace('.webm', '-optimized.webm');
+              
+              await optimizeVideoWithFFmpeg(inputPath, outputPath);
+              
+              const optimizedData = fs.readFileSync(outputPath);
+              const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024)); // Используем CHUNK_SIZE из клиента
+              
+              // Обновляем хедер и чанки
+              db.transaction(() => {
+                stmtDeleteChunks.run(data.fileId);
+                db.prepare(`UPDATE file_headers SET size=?, total_chunks=? WHERE file_id=?`).run(optimizedData.length, newTotalChunks, data.fileId);
+                for (let i = 0; i < newTotalChunks; i++) {
+                  const start = i * (256 * 1024);
+                  const chunk = optimizedData.slice(start, start + (256 * 1024));
+                  stmtInsertChunk.run(data.fileId, i, chunk.toString('base64'), Date.now());
+                }
+              })();
+              
+              const updatedHeader = stmtGetHeader.get(data.fileId);
+              const payload = {
+                fileId: data.fileId,
+                senderId: header.sender_id,
+                name: updatedHeader.name,
+                size: updatedHeader.size,
+                mimeType: updatedHeader.mime_type,
+                totalChunks: updatedHeader.total_chunks,
+                caption: updatedHeader.caption,
+                ts: updatedHeader.ts
+              };
+              
+              const eventId = enqueueEvent(updatedHeader.recipient_id, 'file-available', payload);
+              const recipientWs = peers.get(updatedHeader.recipient_id);
+              if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+                send(recipientWs, { type: 'file-available', ...payload, eventId });
+              }
+            } catch (e) {
+              console.error('[VN-Optimize] Error:', e);
+              // Если ошибка — отправляем как есть
+              const payload = { fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, caption: header.caption, ts: header.ts };
+              const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+              const recipientWs = peers.get(header.recipient_id);
+              if(recipientWs && recipientWs.readyState === WebSocket.OPEN) send(recipientWs, { type: 'file-available', ...payload, eventId });
+            } finally {
+              cleanupTemporaryFile(inputPath);
+              cleanupTemporaryFile(outputPath);
+            }
+          })();
+          return;
+        }
+
         const payload = {
           fileId: data.fileId,
           senderId: myId,
