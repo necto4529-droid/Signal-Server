@@ -122,21 +122,21 @@ async function sendPush(userId, message) {
 // ─── АУДИО ОБРАБОТКА (FFmpeg) ─────────────────────────────────────────────────
 async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    // Продвинутые параметры для идеального качества при минимальном весе:
+    // ── СТУДИЙНОЕ КАЧЕСТВО (Telegram/Fury-уровень) ──
     // - libopus: лучший кодек для речи
-    // - 128k: битрейт "прозрачного" качества
+    // - 192k: студийный битрейт (практически без потерь качества)
     // - vbr on: переменный битрейт для экономии места
-    // - application voip: оптимизация под человеческий голос
+    // - application audio: режим Music/Studio (сохраняет весь тембр голоса)
     const ffmpegArgs = [
       '-i', inputPath,
       '-c:a', 'libopus',
-      '-b:a', '128k',
+      '-b:a', '192k', // Студийное качество (192-256kbps)
       '-vbr', 'on',
       '-compression_level', '10',
       '-ar', '48000',
       '-ac', '1',
-      '-application', 'voip',
-      '-filter_complex', 'afftdn=nr=20:nf=-20:rn=0.01:rf=0.01,adeclick,acompressor=ratio=4:attack=20:release=200:threshold=-20:detection=peak,loudnorm',
+      '-application', 'audio', // 'audio' (music) вместо 'voip' для сохранения всех нюансов тембра
+      '-filter_complex', 'afftdn=nr=10:nf=-15:rn=0.01:rf=0.01,adeclick,acompressor=ratio=3:attack=5:release=50:threshold=-15:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11', // Более мягкая фильтрация, чтобы не портить "кристальность"
       '-y',
       outputPath
     ];
