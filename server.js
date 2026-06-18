@@ -576,6 +576,7 @@ wss.on('connection', (ws) => {
     if(data.type === 'fetch-file') {
       if(!myId) return;
       const fileId = data.fileId;
+      const fromIndex = data.fromIndex || 0;  // ИСПРАВЛЕНИЕ: поддержка resume download
       const header = stmtGetHeader.get(fileId);
       if(!header) { send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' }); return; }
       if(header.recipient_id !== myId) { send(ws, { type: 'file-fetch-error', fileId, msg: 'Access denied' }); return; }
@@ -596,11 +597,15 @@ wss.on('connection', (ws) => {
         mimeType: header.mime_type,
         totalChunks: totalChunks,
         caption: header.caption,
-        ts: header.ts
+        ts: header.ts,
+        fromIndex: fromIndex  // ИСПРАВЛЕНИЕ: отправляем клиенту, с какого индекса начинаем
       });
 
+      // ИСПРАВЛЕНИЕ: отправляем только чанки, начиная с fromIndex (resume download)
       for(const chunk of chunks) {
-        send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
+        if(chunk.chunk_index >= fromIndex) {
+          send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
+        }
       }
       return;
     }
@@ -608,10 +613,20 @@ wss.on('connection', (ws) => {
     if(data.type === 'ack-file') {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
-      if(header && (header.recipient_id === myId || header.sender_id === myId)) {
-        stmtDeleteChunks.run(data.fileId);
-        stmtDeleteHeader.run(data.fileId);
-        stmtDeleteFileAvail.run(myId, data.fileId);
+      if(header) {
+        // ИСПРАВЛЕНИЕ: удаляем файл ТОЛЬКО если подтверждение пришло от получателя (recipient)
+        // Отправитель (sender) может отправить ack, но это не означает, что файл полностью скачан
+        if(header.recipient_id === myId) {
+          // Это ack от получателя — файл успешно скачан и сохранён
+          stmtDeleteChunks.run(data.fileId);
+          stmtDeleteHeader.run(data.fileId);
+          stmtDeleteFileAvail.run(myId, data.fileId);
+          console.log(`[File] Deleted ${data.fileId} after recipient ack`);
+        } else if(header.sender_id === myId) {
+          // Это ack от отправителя (подтверждение доставки) — НЕ удаляем, файл может быть нужен для других
+          // Файл удалится только когда получатель пришлёт ack
+          console.log(`[File] Received ack from sender for ${data.fileId}, keeping file`);
+        }
       }
       return;
     }
