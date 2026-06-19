@@ -288,6 +288,9 @@ const wss = new WebSocket.Server({
 });
 
 const peers = new Map();
+// ФИКС: Подписки на стриминг файлов. fileId -> Set(ws)
+// Когда прилетает новый чанк, мы пушим его всем подписчикам.
+const activeFetchers = new Map();
 const heartbeats = new Map();
 const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
 
@@ -629,6 +632,24 @@ wss.on('connection', (ws) => {
           return;
         }
 
+        // ФИКС: PUSH-стриминг чанков.
+        // Если кто-то сейчас «слушает» этот файл (fetch-file), проталкиваем ему чанки мгновенно.
+        const fetchers = activeFetchers.get(data.fileId);
+        if (fetchers) {
+          data.chunks.forEach(c => {
+            const chunkMsg = {
+              type: 'file-data-chunk',
+              fileId: data.fileId,
+              index: c.index,
+              total: header.total_chunks,
+              data: c.data
+            };
+            fetchers.forEach(fws => {
+              if (fws.readyState === WebSocket.OPEN) send(fws, chunkMsg);
+            });
+          });
+        }
+
         // Обычный файл — отправляем file-upload-complete отправителю
         // file-available уже был отправлен получателю после первого чанка
         // Обновляем chunksReady до финального значения
@@ -663,58 +684,35 @@ wss.on('connection', (ws) => {
     if(data.type === 'fetch-file') {
       if(!myId) return;
       const fileId = data.fileId;
-      const fromIndex = data.fromIndex || 0;  // поддержка resume download
+      const fromIndex = data.fromIndex || 0;
       const header = stmtGetHeader.get(fileId);
       if(!header) { send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' }); return; }
       if(header.recipient_id !== myId) { send(ws, { type: 'file-fetch-error', fileId, msg: 'Access denied' }); return; }
 
-      // ОПТИМИЗАЦИЯ 4: Клиент собирает чанки сам через Blob
-      // Сервер отдаёт чанки как есть, без склейки
+      // ФИКС: Подписываем клиента на новые чанки этого файла (PUSH-стриминг)
+      // Теперь сервер будет сам «проталкивать» новые чанки по мере их поступления
+      if (!activeFetchers.has(fileId)) activeFetchers.set(fileId, new Set());
+      activeFetchers.get(fileId).add(ws);
+
       const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(fileId);
+      
+      // Отправляем заголовок с информацией о текущем прогрессе на сервере
+      send(ws, {
+        type: 'file-data-header',
+        fileId: fileId,
+        senderId: header.sender_id,
+        name: header.name,
+        size: header.size,
+        mimeType: header.mime_type,
+        totalChunks: header.total_chunks,
+        caption: header.caption,
+        thumb: header.thumb || '',
+        ts: header.ts,
+        fromIndex: fromIndex,
+        chunksReady: chunks.length
+      });
 
-      // Если чанков нет вообще — ошибка
-      if(chunks.length === 0) {
-        send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' });
-        return;
-      }
-
-      // Если чанков меньше чем ожидается — сообщаем сколько есть (partial)
-      // Клиент может начать скачивать то что есть, а потом запросить остаток
-      if(chunks.length < header.total_chunks) {
-        // Частичная доступность — отправляем заголовок с реальным кол-вом
-        send(ws, {
-          type: 'file-data-header',
-          fileId: fileId,
-          senderId: header.sender_id,
-          name: header.name,
-          size: header.size,
-          mimeType: header.mime_type,
-          totalChunks: header.total_chunks,
-          caption: header.caption,
-          thumb: header.thumb || '',
-          ts: header.ts,
-          fromIndex: fromIndex,
-          chunksReady: chunks.length  // сколько чанков реально есть сейчас
-        });
-      } else {
-        // Все чанки есть
-        send(ws, {
-          type: 'file-data-header',
-          fileId: fileId,
-          senderId: header.sender_id,
-          name: header.name,
-          size: header.size,
-          mimeType: header.mime_type,
-          totalChunks: header.total_chunks,
-          caption: header.caption,
-          thumb: header.thumb || '',
-          ts: header.ts,
-          fromIndex: fromIndex,
-          chunksReady: chunks.length
-        });
-      }
-
-      // Отправляем чанки начиная с fromIndex
+      // Отправляем те чанки, которые УЖЕ есть в базе
       for(const chunk of chunks) {
         if(chunk.chunk_index >= fromIndex) {
           send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
@@ -918,7 +916,18 @@ wss.on('connection', (ws) => {
     if(myId) {
       clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
-      if(peers.get(myId) === ws) { peers.delete(myId); broadcastPresence(myId, false); }
+      if(peers.get(myId) === ws) { 
+        peers.delete(myId); 
+        broadcastPresence(myId, false); 
+      }
+      
+      // ФИКС: Очищаем подписки этого клиента на стриминг файлов
+      activeFetchers.forEach((subs, fileId) => {
+        if (subs.has(ws)) {
+          subs.delete(ws);
+          if (subs.size === 0) activeFetchers.delete(fileId);
+        }
+      });
     }
   });
   ws.on('error', (err) => console.error('WS error:', err.message));
