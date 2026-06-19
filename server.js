@@ -637,13 +637,23 @@ wss.on('connection', (ws) => {
           send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
         }
 
+        // ФИКС: Отправляем уведомление о завершении загрузки
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
         
-        // ОПТИМИЗАЦИЯ 3: когда загрузка завершена, уведомляем получателя (✔✔)
-        const deliveryPayload = { fileId: data.fileId, by: header.recipient_id };
-        const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
-        const senderWs = peers.get(header.sender_id);
-        if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+        // ОПТИМИЗАЦИЯ 3: когда загрузка завершена на сервер, уведомляем получателя (✔✔)
+        // Но делаем это через небольшую задержку, чтобы база успела закоммитить WAL чанки
+        setTimeout(() => {
+          const deliveryPayload = { fileId: data.fileId, by: header.recipient_id };
+          const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+          const senderWs = peers.get(header.sender_id);
+          if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+          
+          // Также форсируем уведомление получателя о финальном количестве чанков
+          const recipientWs = peers.get(header.recipient_id);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: header.total_chunks, totalChunks: header.total_chunks });
+          }
+        }, 100);
       } else {
         send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       }
