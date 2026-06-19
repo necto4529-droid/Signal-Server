@@ -464,10 +464,15 @@ wss.on('connection', (ws) => {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
       if(header && header.recipient_id === myId) {
-        const deliveryPayload = { fileId: data.fileId, by: myId };
-        const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
-        const senderWs = peers.get(header.sender_id);
-        if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+        // Уведомляем отправителя о доставке (✔✔) ТОЛЬКО когда файл полностью загружен на сервер
+        // и получатель подтвердил получение заголовка
+        const cnt = stmtCountChunks.get(data.fileId);
+        if(cnt && cnt.cnt >= header.total_chunks) {
+          const deliveryPayload = { fileId: data.fileId, by: myId };
+          const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+          const senderWs = peers.get(header.sender_id);
+          if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+        }
       }
       return;
     }
@@ -633,6 +638,12 @@ wss.on('connection', (ws) => {
         }
 
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
+        
+        // ОПТИМИЗАЦИЯ 3: когда загрузка завершена, уведомляем получателя (✔✔)
+        const deliveryPayload = { fileId: data.fileId, by: header.recipient_id };
+        const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+        const senderWs = peers.get(header.sender_id);
+        if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
       } else {
         send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       }
@@ -708,10 +719,16 @@ wss.on('connection', (ws) => {
       if(header) {
         if(header.recipient_id === myId) {
           // Это ack от получателя — файл успешно скачан и сохранён
-          stmtDeleteChunks.run(data.fileId);
-          stmtDeleteHeader.run(data.fileId);
-          stmtDeleteFileAvail.run(myId, data.fileId);
-          console.log(`[File] Deleted ${data.fileId} after recipient ack`);
+          // ПРОВЕРКА: Удаляем только если файл реально полностью загружен на сервер!
+          const cnt = stmtCountChunks.get(data.fileId);
+          if(cnt && cnt.cnt >= header.total_chunks) {
+            stmtDeleteChunks.run(data.fileId);
+            stmtDeleteHeader.run(data.fileId);
+            stmtDeleteFileAvail.run(myId, data.fileId);
+            console.log(`[File] Deleted ${data.fileId} after recipient ack`);
+          } else {
+            console.log(`[File] Recipient sent ack for ${data.fileId}, but file is still uploading (${cnt?.cnt}/${header.total_chunks}). Keeping for now.`);
+          }
         } else if(header.sender_id === myId) {
           // Это ack от отправителя — НЕ удаляем, файл может быть нужен получателю
           console.log(`[File] Received ack from sender for ${data.fileId}, keeping file`);
