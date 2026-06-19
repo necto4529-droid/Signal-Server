@@ -661,15 +661,13 @@ wss.on('connection', (ws) => {
         // ФИКС: Отправляем уведомление о завершении загрузки
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
         
-        // ОПТИМИЗАЦИЯ 3: когда загрузка завершена на сервер, уведомляем получателя (✔✔)
-        // Но делаем это через небольшую задержку, чтобы база успела закоммитить WAL чанки
+        // ИСПРАВЛЕНИЕ БАГА: НЕ отправляем file-delivered автоматически при завершении загрузки на сервер.
+        // file-delivered должен приходить ТОЛЬКО когда получатель реально скачал файл
+        // (через file-available-ack или через зашифрованный сигнал от получателя).
+        // Иначе у отправителя сразу ставится ✔✔ даже если получатель офлайн.
+        
+        // Форсируем уведомление получателя о финальном количестве чанков (если он онлайн)
         setTimeout(() => {
-          const deliveryPayload = { fileId: data.fileId, by: header.recipient_id };
-          const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
-          const senderWs = peers.get(header.sender_id);
-          if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
-          
-          // Также форсируем уведомление получателя о финальном количестве чанков
           const recipientWs = peers.get(header.recipient_id);
           if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
             send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: header.total_chunks, totalChunks: header.total_chunks });
