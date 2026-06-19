@@ -8,6 +8,7 @@ const { spawn } = require('child_process');
 const os = require('os');
 
 // ─── SQLite WAL ───────────────────────────────────────────────────────────────
+// ОПТИМИЗАЦИЯ 2: WAL-режим — параллельное чтение/запись без блокировок
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -46,6 +47,7 @@ db.exec(`
     mime_type    TEXT NOT NULL,
     total_chunks INTEGER NOT NULL,
     caption      TEXT DEFAULT '',
+    thumb        TEXT DEFAULT '',
     ts           INTEGER NOT NULL,
     created_at   INTEGER NOT NULL
   );
@@ -61,6 +63,13 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks (file_id);
 `);
 
+// ОПТИМИЗАЦИЯ 2: Миграция — добавляем колонку thumb если её нет (для существующих БД)
+try {
+  db.exec(`ALTER TABLE file_headers ADD COLUMN thumb TEXT DEFAULT ''`);
+} catch(e) {
+  // Колонка уже существует — игнорируем ошибку
+}
+
 // ─── Подготовленные запросы ───────────────────────────────────────────────────
 const stmtInsertEvent     = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
 const stmtGetEvents       = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
@@ -73,10 +82,11 @@ const stmtAckMsg          = db.prepare(`
 `);
 const stmtDeleteById      = db.prepare(`DELETE FROM events WHERE id=?`);
 
+// ОПТИМИЗАЦИЯ 1: stmtInsertHeader теперь включает поле thumb
 const stmtInsertHeader    = db.prepare(`
   INSERT OR REPLACE INTO file_headers
-    (file_id, sender_id, recipient_id, name, size, mime_type, total_chunks, caption, ts, created_at)
-  VALUES (?,?,?,?,?,?,?,?,?,?)
+    (file_id, sender_id, recipient_id, name, size, mime_type, total_chunks, caption, thumb, ts, created_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?)
 `);
 const stmtInsertChunk     = db.prepare(`
   INSERT OR REPLACE INTO file_chunks (file_id, chunk_index, data, created_at)
@@ -148,7 +158,6 @@ async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
 
 async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
-    // ── ИДЕАЛЬНАЯ ПЛАВНОСТЬ И ОПТИМАЛЬНЫЙ ВЕС (Telegram-уровень) ──
     // ── ИДЕАЛЬНАЯ ПЛАВНОСТЬ И ОПТИМАЛЬНЫЙ ВЕС (Telegram-уровень) ──
     // Переходим на H.264 с жестким контролем FPS и битрейта.
     // - libx264: лучший кодек для широкой совместимости и контроля.
@@ -403,10 +412,14 @@ wss.on('connection', (ws) => {
       }));
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
+      // ОПТИМИЗАЦИЯ 3: при reconnect показываем файлы которые уже начали загружаться
+      // (даже если ещё не все чанки получены — клиент увидит thumb сразу)
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
         const cnt = stmtCountChunks.get(h.file_id);
-        if(cnt && cnt.cnt >= h.total_chunks) {
+        // Показываем file-available если есть хотя бы 1 чанк (стриминг)
+        // или если файл полностью загружен
+        if(cnt && cnt.cnt >= 1) {
           send(ws, {
             type: 'file-available',
             fileId: h.file_id,
@@ -416,7 +429,10 @@ wss.on('connection', (ws) => {
             mimeType: h.mime_type,
             totalChunks: h.total_chunks,
             caption: h.caption,
-            ts: h.ts
+            thumb: h.thumb || '',
+            ts: h.ts,
+            // ОПТИМИЗАЦИЯ 4: сообщаем клиенту сколько чанков уже есть
+            chunksReady: cnt.cnt
           });
         }
       }
@@ -461,9 +477,11 @@ wss.on('connection', (ws) => {
       if(!myId) return;
       const recipient = (data.recipientId || '').toLowerCase();
       if(!recipient) return;
+      // ОПТИМИЗАЦИЯ 1: сохраняем thumb из заголовка
       stmtInsertHeader.run(
         data.fileId, myId, recipient, data.name, data.size,
         data.mimeType, data.totalChunks, data.caption || '',
+        data.thumb || '',
         data.ts || Date.now(), Date.now()
       );
       send(ws, { type: 'store-file-header-ack', fileId: data.fileId });
@@ -475,14 +493,71 @@ wss.on('connection', (ws) => {
       const chunks = data.chunks;
       if(!Array.isArray(chunks)) return;
 
+      const header = stmtGetHeader.get(data.fileId);
+      if(!header) return;
+
+      // ОПТИМИЗАЦИЯ 4: Сохраняем чанки как есть (сервер НЕ склеивает)
       for(const chunk of chunks) {
         stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
       }
 
-      const header = stmtGetHeader.get(data.fileId);
-      if(!header) return;
       const cnt = stmtCountChunks.get(data.fileId);
-      if(cnt && cnt.cnt >= header.total_chunks) {
+      const receivedCount = cnt ? cnt.cnt : 0;
+
+      // ОПТИМИЗАЦИЯ 3: Отправляем file-available получателю СРАЗУ после первого чанка
+      // Не ждём пока все чанки загрузятся — получатель начнёт скачивать параллельно
+      if(receivedCount === chunks.length && receivedCount >= 1) {
+        // Это первый батч чанков — сигнализируем получателю немедленно
+        const payload = {
+          fileId: data.fileId,
+          senderId: myId,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          // ОПТИМИЗАЦИЯ 1: передаём thumb в уведомлении
+          thumb: header.thumb || '',
+          ts: header.ts,
+          // ОПТИМИЗАЦИЯ 4: сообщаем сколько чанков уже готово
+          chunksReady: receivedCount
+        };
+
+        const recipientWs = peers.get(header.recipient_id);
+
+        // Проверяем: уже ли отправляли file-available этому получателю для этого файла?
+        const alreadyNotified = db.prepare(
+          `SELECT id FROM events WHERE recipient_id=? AND type='file-available' AND json_extract(payload,'$.fileId')=? LIMIT 1`
+        ).get(header.recipient_id, data.fileId);
+
+        if(!alreadyNotified) {
+          // Первый раз — сохраняем в очередь и отправляем
+          const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            flushPriorityQueue(header.recipient_id);
+            send(recipientWs, { type: 'file-available', ...payload, eventId });
+          } else {
+            const queue = priorityQueues.get(header.recipient_id) || [];
+            queue.push({ type: 'file-available', ...payload, eventId });
+            priorityQueues.set(header.recipient_id, queue);
+            sendPush(header.recipient_id, `📎 ${header.name}`);
+          }
+        } else {
+          // Уже уведомляли — просто обновляем chunksReady у получателя если он онлайн
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
+          }
+        }
+      } else if(receivedCount > chunks.length) {
+        // Последующие батчи — обновляем получателя о прогрессе
+        const recipientWs = peers.get(header.recipient_id);
+        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
+        }
+      }
+
+      // Проверяем завершение загрузки
+      if(receivedCount >= header.total_chunks) {
         // ── Пост-обработка видео-кружков на сервере ──
         if (header.name.includes('__vnote__')) {
           (async () => {
@@ -496,7 +571,7 @@ wss.on('connection', (ws) => {
               await optimizeVideoWithFFmpeg(inputPath, outputPath);
               
               const optimizedData = fs.readFileSync(outputPath);
-              const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024)); // Используем CHUNK_SIZE из клиента
+              const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024));
               
               // Обновляем хедер и чанки
               db.transaction(() => {
@@ -518,9 +593,13 @@ wss.on('connection', (ws) => {
                 mimeType: updatedHeader.mime_type,
                 totalChunks: updatedHeader.total_chunks,
                 caption: updatedHeader.caption,
-                ts: updatedHeader.ts
+                thumb: updatedHeader.thumb || '',
+                ts: updatedHeader.ts,
+                chunksReady: updatedHeader.total_chunks
               };
               
+              // Обновляем событие в очереди (удаляем старое, добавляем новое с актуальными данными)
+              stmtDeleteFileAvail.run(updatedHeader.recipient_id, data.fileId);
               const eventId = enqueueEvent(updatedHeader.recipient_id, 'file-available', payload);
               const recipientWs = peers.get(updatedHeader.recipient_id);
               if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
@@ -530,7 +609,9 @@ wss.on('connection', (ws) => {
             } catch (e) {
               console.error('[VN-Optimize] Error:', e);
               // Если ошибка — отправляем как есть
-              const payload = { fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, caption: header.caption, ts: header.ts };
+              const updHeader = stmtGetHeader.get(data.fileId);
+              const payload = { fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, caption: header.caption, thumb: header.thumb||'', ts: header.ts, chunksReady: header.total_chunks };
+              stmtDeleteFileAvail.run(header.recipient_id, data.fileId);
               const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
               const recipientWs = peers.get(header.recipient_id);
               if(recipientWs && recipientWs.readyState === WebSocket.OPEN) send(recipientWs, { type: 'file-available', ...payload, eventId });
@@ -543,27 +624,12 @@ wss.on('connection', (ws) => {
           return;
         }
 
-        const payload = {
-          fileId: data.fileId,
-          senderId: myId,
-          name: header.name,
-          size: header.size,
-          mimeType: header.mime_type,
-          totalChunks: header.total_chunks,
-          caption: header.caption,
-          ts: header.ts
-        };
-
-        const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+        // Обычный файл — отправляем file-upload-complete отправителю
+        // file-available уже был отправлен получателю после первого чанка
+        // Обновляем chunksReady до финального значения
         const recipientWs = peers.get(header.recipient_id);
         if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-          flushPriorityQueue(header.recipient_id);
-          send(recipientWs, { type: 'file-available', ...payload, eventId });
-        } else {
-          const queue = priorityQueues.get(header.recipient_id) || [];
-          queue.push({ type: 'file-available', ...payload, eventId });
-          priorityQueues.set(header.recipient_id, queue);
-          sendPush(header.recipient_id, `📎 ${header.name}`);
+          send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
         }
 
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
@@ -576,32 +642,58 @@ wss.on('connection', (ws) => {
     if(data.type === 'fetch-file') {
       if(!myId) return;
       const fileId = data.fileId;
-      const fromIndex = data.fromIndex || 0;  // ИСПРАВЛЕНИЕ: поддержка resume download
+      const fromIndex = data.fromIndex || 0;  // поддержка resume download
       const header = stmtGetHeader.get(fileId);
       if(!header) { send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' }); return; }
       if(header.recipient_id !== myId) { send(ws, { type: 'file-fetch-error', fileId, msg: 'Access denied' }); return; }
 
+      // ОПТИМИЗАЦИЯ 4: Клиент собирает чанки сам через Blob
+      // Сервер отдаёт чанки как есть, без склейки
       const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(fileId);
-      if(chunks.length < header.total_chunks) {
-        send(ws, { type: 'file-fetch-partial', fileId, received: chunks.length, total: header.total_chunks });
+
+      // Если чанков нет вообще — ошибка
+      if(chunks.length === 0) {
+        send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' });
         return;
       }
 
-      const totalChunks = header.total_chunks;
-      send(ws, {
-        type: 'file-data-header',
-        fileId: fileId,
-        senderId: header.sender_id,
-        name: header.name,
-        size: header.size,
-        mimeType: header.mime_type,
-        totalChunks: totalChunks,
-        caption: header.caption,
-        ts: header.ts,
-        fromIndex: fromIndex  // ИСПРАВЛЕНИЕ: отправляем клиенту, с какого индекса начинаем
-      });
+      // Если чанков меньше чем ожидается — сообщаем сколько есть (partial)
+      // Клиент может начать скачивать то что есть, а потом запросить остаток
+      if(chunks.length < header.total_chunks) {
+        // Частичная доступность — отправляем заголовок с реальным кол-вом
+        send(ws, {
+          type: 'file-data-header',
+          fileId: fileId,
+          senderId: header.sender_id,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          thumb: header.thumb || '',
+          ts: header.ts,
+          fromIndex: fromIndex,
+          chunksReady: chunks.length  // сколько чанков реально есть сейчас
+        });
+      } else {
+        // Все чанки есть
+        send(ws, {
+          type: 'file-data-header',
+          fileId: fileId,
+          senderId: header.sender_id,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          thumb: header.thumb || '',
+          ts: header.ts,
+          fromIndex: fromIndex,
+          chunksReady: chunks.length
+        });
+      }
 
-      // ИСПРАВЛЕНИЕ: отправляем только чанки, начиная с fromIndex (resume download)
+      // Отправляем чанки начиная с fromIndex
       for(const chunk of chunks) {
         if(chunk.chunk_index >= fromIndex) {
           send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
@@ -614,8 +706,6 @@ wss.on('connection', (ws) => {
       if(!myId) return;
       const header = stmtGetHeader.get(data.fileId);
       if(header) {
-        // ИСПРАВЛЕНИЕ: удаляем файл ТОЛЬКО если подтверждение пришло от получателя (recipient)
-        // Отправитель (sender) может отправить ack, но это не означает, что файл полностью скачан
         if(header.recipient_id === myId) {
           // Это ack от получателя — файл успешно скачан и сохранён
           stmtDeleteChunks.run(data.fileId);
@@ -623,8 +713,7 @@ wss.on('connection', (ws) => {
           stmtDeleteFileAvail.run(myId, data.fileId);
           console.log(`[File] Deleted ${data.fileId} after recipient ack`);
         } else if(header.sender_id === myId) {
-          // Это ack от отправителя (подтверждение доставки) — НЕ удаляем, файл может быть нужен для других
-          // Файл удалится только когда получатель пришлёт ack
+          // Это ack от отправителя — НЕ удаляем, файл может быть нужен получателю
           console.log(`[File] Received ack from sender for ${data.fileId}, keeping file`);
         }
       }
@@ -651,8 +740,6 @@ wss.on('connection', (ws) => {
     }
 
     // ── ack-msg: получатель реально открыл чат / увидел сообщение ───────────
-    // Находим исходное incoming-msg событие в офлайн-очереди, удаляем его и
-    // отправляем отправителю msg-delivered. Именно это двигает 1 галочку → ✔✔.
     if(data.type === 'ack-msg') {
       if(!myId || !data.msgId) return;
       const row = stmtAckMsg.get(myId, data.msgId);
