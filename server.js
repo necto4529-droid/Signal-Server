@@ -563,7 +563,7 @@ function getRandomElement(arr) {
   if (validPaths.includes(req.url) && req.method === 'POST') {
     try {
       const body = await readBody(req);
-      const { clientPublicKeyB64, useECDH } = JSON.parse(body.toString("utf8"));
+      const { clientPublicKeyB64 } = JSON.parse(body.toString("utf8"));
       if (!clientPublicKeyB64) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Missing clientPublicKeyB64 in body" }));
@@ -576,18 +576,11 @@ function getRandomElement(arr) {
         { key: serverRsaKeyPair.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
         encryptedClientPublicKey
       );
-      const clientPublicKey = decryptedClientPublicKey;
+      const clientPublicKey = decryptedClientPublicKey; // This is the actual DH public key
 
-      let serverPublicKey, sharedSecret;
-      if (useECDH) {
-        const ecdh = crypto.createECDH('prime256v1');
-        serverPublicKey = ecdh.generateKeys();
-        sharedSecret = ecdh.computeSecret(clientPublicKey);
-      } else {
-        const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
-        serverPublicKey = dh.generateKeys();
-        sharedSecret = dh.computeSecret(clientPublicKey);
-      }
+      const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
+      const serverPublicKey = dh.generateKeys();
+      const sharedSecret = dh.computeSecret(clientPublicKey);
 
       const sid = crypto.randomBytes(16).toString('hex'); // Session ID
       const sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32); // 32-byte key
@@ -671,35 +664,17 @@ function getRandomElement(arr) {
       const responseJson = JSON.stringify({ batch: responseBuffer });
       const encoded = await stealthEncode({ batch: responseBuffer }, sess.key);
 
-      const headers = {
+      res.writeHead(200, {
         'Content-Type': 'application/wasm',
+        'Content-Length': encoded.length,
         'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'no-store',
         'User-Agent': getRandomElement(USER_AGENTS),
         'Accept-Language': getRandomElement(ACCEPT_LANGUAGES),
         'Referer': getRandomElement(REFERERS),
-      };
 
-      const acceptEncoding = req.headers['accept-encoding'] || '';
-      if (acceptEncoding.includes('gzip')) {
-        const zlib = require('zlib');
-        zlib.gzip(encoded, (err, zipped) => {
-          if (err) {
-            headers['Content-Length'] = encoded.length;
-            res.writeHead(200, headers);
-            res.end(encoded);
-          } else {
-            headers['Content-Encoding'] = 'gzip';
-            headers['Content-Length'] = zipped.length;
-            res.writeHead(200, headers);
-            res.end(zipped);
-          }
-        });
-      } else {
-        headers['Content-Length'] = encoded.length;
-        res.writeHead(200, headers);
-        res.end(encoded);
-      }
+      });
+      res.end(encoded);
     } catch(e) {
       console.error('[Stealth-HTTP] Poll error:', e.message);
       res.writeHead(500);
@@ -721,15 +696,6 @@ healthServer.listen(HEALTH_PORT, () => {
 const wss = new WebSocket.Server({
   noServer: true, // Attach to healthServer later
   maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
-  perMessageDeflate: {
-    zlibDeflateOptions: { level: 3 },
-    zlibInflateOptions: { chunkSize: 10 * 1024 },
-    clientNoContextTakeover: true,
-    serverNoContextTakeover: true,
-    serverMaxWindowBits: 10,
-    concurrencyLimit: 10,
-    threshold: 1024
-  },
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -747,7 +713,7 @@ const wss = new WebSocket.Server({
 const peers = new Map();
 const activeFetchers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 90_000;   // 90 секунд (быстрое обнаружение зависаний)
+const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
 
 // Rate limiting
 const rateLimits = new Map();
@@ -1158,10 +1124,6 @@ async function handleMessage(ws, data, sessionId) {
 
 wss.on("connection", (ws, req) => {
   console.log("Client connected");
-  if (ws._socket) {
-    ws._socket.setKeepAlive(true, 15000);
-    ws._socket.setNoDelay(true);
-  }
   ws._myId = null; // Will be set on 'register'
   ws._stealthKey = null; // Will be set on 'stealth-hello'
   ws._stealthTxCounter = 0;
@@ -1217,9 +1179,6 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.isAlive = true;
-  ws.on('pong', () => { ws.isAlive = true; });
-
   ws.on("close", () => {
     console.log(`Client ${ws._myId || 'unknown'} disconnected.`);
     if (ws._myId) {
@@ -1235,18 +1194,6 @@ wss.on("connection", (ws, req) => {
   ws.on("error", (error) => {
     console.error("WebSocket error:", error);
   });
-});
-
-const wsPingInterval = setInterval(() => {
-  wss.clients.forEach((ws) => {
-    if (ws.isAlive === false) return ws.terminate();
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 30000);
-
-wss.on('close', () => {
-  clearInterval(wsPingInterval);
 });
 
 // Attach WebSocket server to the HTTP server
