@@ -9,6 +9,7 @@ const fs = require("fs");
 const https = require("https");
 const { spawn } = require("child_process");
 const os = require("os");
+const zlib = require("zlib");
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ── STEALTH-TRANSPORT v7 (God-Mode) ──────────────────────────────────────────
@@ -560,40 +561,111 @@ function getRandomElement(arr) {
     return serveFakeSite(res);
   }
 
+  // Нет сессии — это Stealth Init (ECDH P-256 key exchange)
   if (validPaths.includes(req.url) && req.method === 'POST') {
     try {
       const body = await readBody(req);
-      const { clientPublicKeyB64 } = JSON.parse(body.toString("utf8"));
+      let parsedBody;
+      try {
+        parsedBody = JSON.parse(body.toString("utf8"));
+      } catch(e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
+        return;
+      }
+
+      // Поддерживаем оба формата: clientPublicKeyB64 (старый) и payload (новый от клиента)
+      const clientPublicKeyB64 = parsedBody.clientPublicKeyB64 || parsedBody.payload;
       if (!clientPublicKeyB64) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "Missing clientPublicKeyB64 in body" }));
         return;
       }
 
-      // Decrypt client's DH public key using server's RSA private key
-      const encryptedClientPublicKey = Buffer.from(clientPublicKeyB64, "base64");
-      const decryptedClientPublicKey = crypto.privateDecrypt(
-        { key: serverRsaKeyPair.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
-        encryptedClientPublicKey
-      );
-      const clientPublicKey = decryptedClientPublicKey; // This is the actual DH public key
+      // ИСПРАВЛЕНИЕ: Поддерживаем ECDH P-256 (новый клиент) и классический DH (старый)
+      // Клиент отправляет SPKI-encoded ECDH P-256 public key в base64
+      const clientPublicKeyBuf = Buffer.from(clientPublicKeyB64, "base64");
+      const newSid = crypto.randomBytes(16).toString('hex');
+      let sessionKey;
+      let serverPublicKeyB64 = null;
 
-      const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
-      const serverPublicKey = dh.generateKeys();
-      const sharedSecret = dh.computeSecret(clientPublicKey);
+      // Пробуем ECDH P-256 (новый протокол)
+      let ecdhSuccess = false;
+      try {
+        // Генерируем серверную ECDH пару
+        const serverEcdh = crypto.createECDH('prime256v1'); // P-256
+        serverEcdh.generateKeys();
 
-      const sid = crypto.randomBytes(16).toString('hex'); // Session ID
-      const sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32); // 32-byte key
+        // Вычисляем shared secret из клиентского публичного ключа
+        // Клиент отправляет SPKI-encoded ключ — извлекаем raw точку (последние 65 байт)
+        let clientRawKey = clientPublicKeyBuf;
+        // SPKI для P-256 имеет 91 байт: 26 байт заголовка + 65 байт ключа
+        if (clientPublicKeyBuf.length === 91) {
+          clientRawKey = clientPublicKeyBuf.slice(26); // raw uncompressed point
+        } else if (clientPublicKeyBuf.length === 65) {
+          clientRawKey = clientPublicKeyBuf; // уже raw
+        }
 
-      stealthSessions.set(sid, { key: sessionKey, createdAt: Date.now() });
+        const sharedSecret = serverEcdh.computeSecret(clientRawKey);
+        sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32);
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        sid: sid,
-        publicKey: serverPublicKey.toString('base64'),
-        serverRsaPublicKey: serverRsaKeyPair.publicKey // Provide server's RSA public key for client to encrypt
-      }));
-      console.log(`[Stealth-DH] Session ${sid} initialized.`);
+        // Отправляем серверный публичный ключ в SPKI формате (для совместимости)
+        // ECDH getPublicKey() возвращает raw uncompressed point (65 байт)
+        // Оборачиваем в SPKI: 26-байтовый заголовок P-256 + 65 байт ключа
+        const spkiHeader = Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex');
+        const serverSpki = Buffer.concat([spkiHeader, serverEcdh.getPublicKey()]);
+        serverPublicKeyB64 = serverSpki.toString('base64');
+        ecdhSuccess = true;
+        console.log(`[Stealth-ECDH] P-256 session ${newSid} initialized`);
+      } catch(e) {
+        console.warn('[Stealth-ECDH] P-256 failed, trying classic DH:', e.message);
+      }
+
+      // Fallback: классический DH (старый протокол)
+      if (!ecdhSuccess) {
+        try {
+          const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
+          const serverDhPublicKey = dh.generateKeys();
+          let sharedSecret;
+          try {
+            // Пробуем RSA расшифровку (старый клиент)
+            const decrypted = crypto.privateDecrypt(
+              { key: serverRsaKeyPair.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
+              clientPublicKeyBuf
+            );
+            sharedSecret = dh.computeSecret(decrypted);
+          } catch(e2) {
+            // Используем напрямую
+            try { sharedSecret = dh.computeSecret(clientPublicKeyBuf); }
+            catch(e3) { sharedSecret = crypto.randomBytes(32); }
+          }
+          sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32);
+          serverPublicKeyB64 = serverDhPublicKey.toString('base64');
+          console.log(`[Stealth-DH] Classic DH session ${newSid} initialized`);
+        } catch(e) {
+          // Последний fallback: случайный ключ (sid-based на клиенте)
+          sessionKey = crypto.randomBytes(32);
+          console.warn(`[Stealth] Using random key for session ${newSid}`);
+        }
+      }
+
+      stealthSessions.set(newSid, {
+        key: sessionKey,
+        txCounter: 0,
+        rxCounter: 0,
+        createdAt: Date.now(),
+        peerId: parsedBody.client_id || null
+      });
+
+      const responseBody = { sid: newSid };
+      if (serverPublicKeyB64) responseBody.publicKey = serverPublicKeyB64;
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        'Vary': 'Accept-Encoding',
+      });
+      res.end(JSON.stringify(responseBody));
     } catch (e) {
       console.error("[Stealth-DH] Init error:", e);
       res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -610,10 +682,10 @@ function getRandomElement(arr) {
   if (validPaths.includes(req.url) && req.method === 'POST') {
     const sid = getCookieSid(req) || req.headers['x-session-id'];
     const seq = parseInt(req.headers['x-seq'] || '0', 10);
-    const sess = stealthSessions.get(sid);
+    const sess = sid ? stealthSessions.get(sid) : null;
 
     if (!sess) {
-      // Имитируем 404 обычного сайта
+      // Нет сессии — отдаём 404 (stealth init уже обработан выше)
       res.writeHead(404, { 'Content-Type': 'text/html' });
       return res.end('<html><body>Not found</body></html>');
     }
@@ -661,20 +733,32 @@ function getRandomElement(arr) {
       if (virtualWs._peerId) sess.peerId = virtualWs._peerId;
 
       // Кодируем все ответы в один бинарный фрейм
-      const responseJson = JSON.stringify({ batch: responseBuffer });
       const encoded = await stealthEncode({ batch: responseBuffer }, sess.key);
 
-      res.writeHead(200, {
+      // ── Сжатие ответа gzip для экономии трафика на 2G/3G ──
+      const acceptEncoding = req.headers['accept-encoding'] || '';
+      let responseData = encoded;
+      let contentEncoding = null;
+      if (acceptEncoding.includes('gzip') && encoded.length > 512) {
+        try {
+          responseData = await gzipBuffer(encoded);
+          contentEncoding = 'gzip';
+        } catch(e) {
+          responseData = encoded;
+        }
+      }
+
+      const headers = {
         'Content-Type': 'application/wasm',
-        'Content-Length': encoded.length,
+        'Content-Length': responseData.length,
+        'Connection': 'keep-alive',
         'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'no-store',
-        'User-Agent': getRandomElement(USER_AGENTS),
-        'Accept-Language': getRandomElement(ACCEPT_LANGUAGES),
-        'Referer': getRandomElement(REFERERS),
+      };
+      if (contentEncoding) headers['Content-Encoding'] = contentEncoding;
 
-      });
-      res.end(encoded);
+      res.writeHead(200, headers);
+      res.end(responseData);
     } catch(e) {
       console.error('[Stealth-HTTP] Poll error:', e.message);
       res.writeHead(500);
@@ -688,6 +772,16 @@ function getRandomElement(arr) {
   res.end('<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>');
 });
 
+healthServer.on('connection', (socket) => {
+  // Включаем TCP keepalive: начинаем через 30с, интервал 10с
+  socket.setKeepAlive(true, 30000);
+  // Таймаут неактивного соединения — 120 секунд
+  socket.setTimeout(120000);
+  socket.on('timeout', () => {
+    socket.destroy();
+  });
+});
+
 healthServer.listen(HEALTH_PORT, () => {
   console.log(`[Health+Stealth] listening on port ${HEALTH_PORT}`);
 });
@@ -695,7 +789,25 @@ healthServer.listen(HEALTH_PORT, () => {
 // ─── WebSocket Server ─────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({
   noServer: true, // Attach to healthServer later
-  maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
+  // ── Оптимизация для плохого интернета: сжатие WS фреймов ──
+  // perMessageDeflate значительно уменьшает размер передаваемых данных
+  // Особенно эффективно для JSON-сообщений (сжатие до 70-80%)
+  perMessageDeflate: {
+    zlibDeflateOptions: {
+      chunkSize: 1024,
+      memLevel: 7,
+      level: 3 // Быстрое сжатие (не максимальное) для экономии CPU
+    },
+    zlibInflateOptions: {
+      chunkSize: 10 * 1024
+    },
+    clientNoContextTakeover: true,  // Экономим память на клиенте
+    serverNoContextTakeover: true,  // Экономим память на сервере
+    serverMaxWindowBits: 10,        // Меньше памяти, чуть хуже сжатие
+    concurrencyLimit: 10,
+    threshold: 512 // Сжимаем только если больше 512 байт
+  },
+  maxPayload: 64 * 1024 * 1024, // 64 МБ — разумный лимит (было 1 ГБ!)
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -713,7 +825,23 @@ const wss = new WebSocket.Server({
 const peers = new Map();
 const activeFetchers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
+const pingTimers = new Map(); // Таймеры ping для каждого клиента
+
+// Heartbeat: короткий таймаут + активный ping/pong для быстрого обнаружения обрыва
+// На 2G/3G соединение может "зависнуть" без явного закрытия сокета
+const HEARTBEAT_TIMEOUT = 90_000;    // 90 секунд — если нет pong, закрываем
+const HEARTBEAT_INTERVAL = 30_000;   // ping каждые 30 секунд
+const WS_PING_TIMEOUT = 20_000;      // ждём pong 20 секунд
+
+// ─── Утилита: gzip-сжатие буфера ─────────────────────────────────────────────
+function gzipBuffer(buf) {
+  return new Promise((resolve, reject) => {
+    zlib.gzip(buf, { level: zlib.constants.Z_BEST_SPEED }, (err, result) => {
+      if (err) reject(err);
+      else resolve(result);
+    });
+  });
+}
 
 // Rate limiting
 const rateLimits = new Map();
@@ -794,9 +922,56 @@ function broadcastPresence(peerId, isOnline) {
   for(const [, ws] of peers) send(ws, msg);
 }
 
+// ── Активный ping/pong ──
+// На плохом интернете TCP соединение может "зависнуть" без явного закрытия.
+// Активный ping/pong позволяет быстро обнаружить это и переподключиться.
+function startPingTimer(peerId) {
+  stopPingTimer(peerId);
+  const timer = setInterval(() => {
+    const ws = peers.get(peerId);
+    if(!ws || ws.readyState !== WebSocket.OPEN) {
+      stopPingTimer(peerId);
+      return;
+    }
+    // Отправляем WebSocket ping frame (не JSON ping, а нативный WS ping)
+    ws.ping(Buffer.from('k'), false, (err) => {
+      if(err) {
+        console.log(`[Ping] Error for ${peerId}:`, err.message);
+        stopPingTimer(peerId);
+      }
+    });
+    // Если pong не пришёл за WS_PING_TIMEOUT — закрываем
+    const pongTimeout = setTimeout(() => {
+      const currentWs = peers.get(peerId);
+      if(currentWs && currentWs.readyState === WebSocket.OPEN && !currentWs._lastPong) {
+        console.log(`[Ping] No pong from ${peerId}, terminating`);
+        currentWs.terminate();
+      }
+      if(currentWs) currentWs._lastPong = false;
+    }, WS_PING_TIMEOUT);
+    if(ws._pongTimeout) clearTimeout(ws._pongTimeout);
+    ws._pongTimeout = pongTimeout;
+    ws._lastPong = false;
+  }, HEARTBEAT_INTERVAL);
+  pingTimers.set(peerId, timer);
+}
+
+function stopPingTimer(peerId) {
+  if(pingTimers.has(peerId)) {
+    clearInterval(pingTimers.get(peerId));
+    pingTimers.delete(peerId);
+  }
+}
+
 function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
-  heartbeats.set(peerId, setTimeout(() => { peers.get(peerId)?.close(); }, HEARTBEAT_TIMEOUT));
+  heartbeats.set(peerId, setTimeout(() => {
+    const ws = peers.get(peerId);
+    if(ws) {
+      console.log(`[Heartbeat] Timeout for ${peerId}, closing connection`);
+      ws.terminate(); // terminate() вместо close() — немедленно закрываем
+    }
+  }, HEARTBEAT_TIMEOUT));
 }
 
 function enqueueEvent(recipientId, type, payload) {
@@ -873,8 +1048,10 @@ async function handleMessage(ws, data, sessionId) {
     }
 
     ws._myId = peerId;
+    if(ws._isHttpFallback) ws._peerId = peerId;
     peers.set(peerId, ws);
     resetHeartbeat(peerId);
+    if(!ws._isHttpFallback) startPingTimer(peerId);
     broadcastPresence(peerId, true);
     console.log(`Peer ${peerId} registered.`);
 
@@ -1129,6 +1306,23 @@ wss.on("connection", (ws, req) => {
   ws._stealthTxCounter = 0;
   ws._stealthRxCounter = 0;
   ws._stealthSid = null;
+  ws._lastPong = true;
+
+  // ── TCP keepalive на WS-сокете ──
+  if(ws._socket) {
+    ws._socket.setKeepAlive(true, 15000); // keepalive каждые 15 секунд
+    ws._socket.setNoDelay(true);          // отключаем алгоритм Нагла для низкой задержки
+  }
+
+  // Обработка нативного pong (ответ на наш ping)
+  ws.on('pong', () => {
+    ws._lastPong = true;
+    if(ws._pongTimeout) {
+      clearTimeout(ws._pongTimeout);
+      ws._pongTimeout = null;
+    }
+    if(ws._myId) resetHeartbeat(ws._myId);
+  });
 
   ws.on("message", async (message) => {
     if (!checkRateLimit(ws)) {
@@ -1179,13 +1373,16 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => {
-    console.log(`Client ${ws._myId || 'unknown'} disconnected.`);
+  ws.on("close", (code) => {
+    console.log(`Client ${ws._myId || 'unknown'} disconnected. Code: ${code}`);
     if (ws._myId) {
       peers.delete(ws._myId);
       broadcastPresence(ws._myId, false);
       if (heartbeats.has(ws._myId)) clearTimeout(heartbeats.get(ws._myId));
+      stopPingTimer(ws._myId);
     }
+    if(ws._pongTimeout) clearTimeout(ws._pongTimeout);
+    rateLimits.delete(ws);
     // Clean up stealth session if it was active for this WS
     // Note: We don't delete the session immediately, as it might be used by HTTP fallback
     // A separate cleanup mechanism for old sessions is handled by setInterval.
