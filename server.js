@@ -11,33 +11,28 @@ const { spawn } = require("child_process");
 const os = require("os");
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ── STEALTH-TRANSPORT v7 (God-Mode) ──────────────────────────────────────────
-// Максимальная мимикрия и устойчивость к блокировкам.
+// ── STEALTH-TRANSPORT v6 (Quantum-Obfuscation) ───────────────────────────────
+// Глубокая мимикрия трафика для максимального обхода DPI/ТСПУ.
 //
 // Режимы работы:
 //   1. WebSocket + Stealth-бинарный фрейм (основной)
 //   2. HTTP POST fallback (если WS заблокирован) с мимикрией под аналитику/WASM
 //
-// Протокол фрейма (v7):
-//   [4 байта] WASM Magic (00 61 73 6D) — для маскировки под WebAssembly
-//   [12 байт] AES-GCM IV
-//   [16 байт] AES-GCM Auth Tag
-//   [остаток] AES-GCM Encrypted Payload
+// Протокол фрейма (v6):
+//   [4 байта] magic XOR'd  — всегда разные, не детектируемые
+//   [2 байта] pad_len LE   — длина шума (XOR'd)
+//   [pad_len] padding      — случайный мусор
+//   [остаток] payload      — XOR-поток с rolling-ключом
 //
-// НОВОЕ в v7 (God-Mode):
-//   1. AES-GCM шифрование: замена XOR на стойкий алгоритм.
-//   2. WASM Magic Bytes: реальные магические байты WebAssembly в начале фрейма.
-//   3. Handshake в теле запроса: удаление аномальных заголовков, ключ в JSON.
-//   4. Динамическая фрагментация: разбиение больших сообщений на части.
-//   5. Многоуровневая мимикрия: под Google/Cloudflare.
+// НОВОЕ в v6 (Quantum-Obfuscation):
+//   1. WASM-инкапсуляция: бинарные данные маскируются под WebAssembly-модули.
+//   2. IAT Shaping (Inter-arrival Time): имитация временных интервалов между пакетами.
+//   3. Header Morphing: ротация User-Agent, Accept-Language, Referer.
+//   4. Deep Active Probing Defense: реалистичные страницы ошибок Nginx/Apache или "под обслуживанием".
 // ═══════════════════════════════════════════════════════════════════════════
 
-const WASM_MAGIC_BYTES = Buffer.from([0x00, 0x61, 0x73, 0x6D]); // \0asm
-const AES_GCM_IV_LENGTH = 12;
-const AES_GCM_TAG_LENGTH = 16;
-
 const STEALTH_MAGIC_SERVER = new Uint8Array([0xCA, 0xFE, 0xBA, 0xBE]);
-const STEALTH_VER = 0x07; // Версия протокола Stealth-Transport
+const STEALTH_VER = 0x06; // Версия протокола Stealth-Transport
 const STEALTH_PAD_MIN = 8;
 const STEALTH_PAD_MAX = 128;
 // Bimodal Traffic Shaping parameters
@@ -562,16 +557,15 @@ function getRandomElement(arr) {
 
   if (validPaths.includes(req.url) && req.method === 'POST') {
     try {
-      const body = await readBody(req);
-      const { clientPublicKeyB64 } = JSON.parse(body.toString("utf8"));
-      if (!clientPublicKeyB64) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Missing clientPublicKeyB64 in body" }));
+      const encryptedClientPublicKeyB64 = req.headers['x-client-public-key'];
+      if (!encryptedClientPublicKeyB64) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Missing X-Client-Public-Key header' }));
         return;
       }
 
       // Decrypt client's DH public key using server's RSA private key
-      const encryptedClientPublicKey = Buffer.from(clientPublicKeyB64, "base64");
+      const encryptedClientPublicKey = Buffer.from(encryptedClientPublicKeyB64, 'base64');
       const decryptedClientPublicKey = crypto.privateDecrypt(
         { key: serverRsaKeyPair.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
         encryptedClientPublicKey
@@ -585,7 +579,7 @@ function getRandomElement(arr) {
       const sid = crypto.randomBytes(16).toString('hex'); // Session ID
       const sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32); // 32-byte key
 
-      stealthSessions.set(sid, { key: sessionKey, createdAt: Date.now() });
+      stealthSessions.set(sid, { key: sessionKey, txCounter: 0, rxCounter: 0, dh: dh, createdAt: Date.now() });
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -620,7 +614,7 @@ function getRandomElement(arr) {
 
     try {
       const body = await readBody(req);
-      const decoded = await stealthDecode(body, sess.key);
+      const decoded = stealthDecode(body, sess.key, seq);
       if (!decoded) {
         res.writeHead(400);
         return res.end();
@@ -662,7 +656,8 @@ function getRandomElement(arr) {
 
       // Кодируем все ответы в один бинарный фрейм
       const responseJson = JSON.stringify({ batch: responseBuffer });
-      const encoded = await stealthEncode({ batch: responseBuffer }, sess.key);
+      const encoded = stealthEncode({ batch: responseBuffer }, sess.key, sess.txCounter);
+      sess.txCounter += responseJson.length;
 
       res.writeHead(200, {
         'Content-Type': 'application/wasm',
