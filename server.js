@@ -9,30 +9,191 @@ const fs = require("fs");
 const https = require("https");
 const { spawn } = require("child_process");
 const os = require("os");
+const zlib = require("zlib");
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ── STEALTH-TRANSPORT v6 (Quantum-Obfuscation) ───────────────────────────────
-// Глубокая мимикрия трафика для максимального обхода DPI/ТСПУ.
+// ── STEALTH-TRANSPORT v9 (Multi-Bridge) ────────────────────────────────────
+// Максимальная мимикрия и устойчивость к блокировкам.
 //
 // Режимы работы:
 //   1. WebSocket + Stealth-бинарный фрейм (основной)
 //   2. HTTP POST fallback (если WS заблокирован) с мимикрией под аналитику/WASM
 //
-// Протокол фрейма (v6):
-//   [4 байта] magic XOR'd  — всегда разные, не детектируемые
-//   [2 байта] pad_len LE   — длина шума (XOR'd)
-//   [pad_len] padding      — случайный мусор
-//   [остаток] payload      — XOR-поток с rolling-ключом
+// Протокол фрейма (v7):
+//   [4 байта] WASM Magic (00 61 73 6D) — для маскировки под WebAssembly
+//   [12 байт] AES-GCM IV
+//   [16 байт] AES-GCM Auth Tag
+//   [остаток] AES-GCM Encrypted Payload
 //
-// НОВОЕ в v6 (Quantum-Obfuscation):
-//   1. WASM-инкапсуляция: бинарные данные маскируются под WebAssembly-модули.
-//   2. IAT Shaping (Inter-arrival Time): имитация временных интервалов между пакетами.
-//   3. Header Morphing: ротация User-Agent, Accept-Language, Referer.
-//   4. Deep Active Probing Defense: реалистичные страницы ошибок Nginx/Apache или "под обслуживанием".
+// НОВОЕ в v9 (Multi-Bridge):
+//   1. AES-GCM шифрование: замена XOR на стойкий алгоритм.
+//   2. WASM Magic Bytes: реальные магические байты WebAssembly в начале фрейма.
+//   3. Handshake в теле запроса: удаление аномальных заголовков, ключ в JSON.
+//   4. Динамическая фрагментация: разбиение больших сообщений на части.
+//   5. Многоуровневая мимикрия: под Google/Cloudflare.
+//
+// ОПТИМИЗАЦИИ ДЛЯ ПЛОХОГО ИНТЕРНЕТА (2G/3G/H):
+//   1. WebSocket perMessageDeflate — сжатие каждого фрейма
+//   2. TCP keepalive на сокетах — быстрое обнаружение обрыва
+//   3. Адаптивный HEARTBEAT — короткий таймаут + ping/pong
+//   4. Сжатие HTTP fallback ответов через gzip
+//   5. Приоритизация очереди сообщений
+//   6. Батчинг событий при reconnect
 // ═══════════════════════════════════════════════════════════════════════════
 
+const WASM_MAGIC_BYTES = Buffer.from([0x00, 0x61, 0x73, 0x6D]); // \0asm
+const WASM_VERSION = Buffer.from([0x01, 0x00, 0x00, 0x00]);
+const WASM_SECTION_ID_DATA = 0x0B;
+const WASM_MEMORY_INDEX = 0x00;
+const WASM_OPCODE_I32_CONST = 0x41;
+const WASM_OPCODE_END = 0x0B;
+
+// Helper to encode LEB128 (used for WASM sizes)
+function encodeLeb128(value) {
+  const bytes = [];
+  while (true) {
+    let byte = value & 0x7f;
+    value >>= 7;
+    if (value !== 0) {
+      byte |= 0x80;
+    }
+    bytes.push(byte);
+    if (value === 0) {
+      break;
+    }
+  }
+  return Buffer.from(bytes);
+}
+
+// Wraps a buffer into a valid WASM Data Section
+function wrapInWasmDataSection(payload) {
+  // Module header
+  const header = Buffer.concat([
+    WASM_MAGIC_BYTES,
+    WASM_VERSION,
+  ]);
+
+  // Data section content
+  // Vector of data segments: count (1) + segment
+  // Segment: memory_index (0x00) + offset_expr (i32.const 0) + size (payload.length)
+  const dataSegmentCount = encodeLeb128(1);
+  const memoryIndex = Buffer.from([WASM_MEMORY_INDEX]);
+  const offsetExpr = Buffer.concat([
+    Buffer.from([WASM_OPCODE_I32_CONST]),
+    encodeLeb128(0),
+    Buffer.from([WASM_OPCODE_END]),
+  ]);
+  const payloadSize = encodeLeb128(payload.length);
+
+  const dataSectionContent = Buffer.concat([
+    dataSegmentCount,
+    memoryIndex,
+    offsetExpr,
+    payloadSize,
+    payload,
+  ]);
+
+  // Data section header: section_id (0x0B) + section_size
+  const dataSectionHeader = Buffer.concat([
+    Buffer.from([WASM_SECTION_ID_DATA]),
+    encodeLeb128(dataSectionContent.length),
+  ]);
+
+  return Buffer.concat([header, dataSectionHeader, dataSectionContent]);
+}
+
+// Unwraps a buffer from a WASM Data Section
+function unwrapFromWasmDataSection(wasmBuffer) {
+  let offset = 0;
+
+  // Check WASM magic and version
+  if (wasmBuffer.length < WASM_MAGIC_BYTES.length + WASM_VERSION.length) return null;
+  if (!wasmBuffer.slice(offset, offset + WASM_MAGIC_BYTES.length).equals(WASM_MAGIC_BYTES)) return null;
+  offset += WASM_MAGIC_BYTES.length;
+  if (!wasmBuffer.slice(offset, offset + WASM_VERSION.length).equals(WASM_VERSION)) return null;
+  offset += WASM_VERSION.length;
+
+  // Read Data Section ID
+  if (wasmBuffer.length < offset + 1) return null;
+  const sectionId = wasmBuffer[offset];
+  offset += 1;
+  if (sectionId !== WASM_SECTION_ID_DATA) return null; // Not a data section
+
+  // Read Data Section Size (LEB128)
+  let sectionSize = 0;
+  let shift = 0;
+  let byte;
+  do {
+    if (wasmBuffer.length < offset + 1) return null;
+    byte = wasmBuffer[offset];
+    offset += 1;
+    sectionSize |= (byte & 0x7f) << shift;
+    shift += 7;
+  } while (byte & 0x80);
+
+  const sectionEnd = offset + sectionSize;
+  if (wasmBuffer.length < sectionEnd) return null;
+
+  // Read Data Segment Count (LEB128)
+  let segmentCount = 0;
+  shift = 0;
+  do {
+    if (wasmBuffer.length < offset + 1) return null;
+    byte = wasmBuffer[offset];
+    offset += 1;
+    segmentCount |= (byte & 0x7f) << shift;
+    shift += 7;
+  } while (byte & 0x80);
+
+  if (segmentCount !== 1) return null; // Expecting exactly one data segment
+
+  // Read Memory Index
+  if (wasmBuffer.length < offset + 1) return null;
+  const memoryIndex = wasmBuffer[offset];
+  offset += 1;
+  if (memoryIndex !== WASM_MEMORY_INDEX) return null;
+
+  // Read Offset Expression (i32.const 0 + end)
+  if (wasmBuffer.length < offset + 1) return null;
+  if (wasmBuffer[offset] !== WASM_OPCODE_I32_CONST) return null;
+  offset += 1;
+
+  // Read i32.const value (LEB128 for 0)
+  shift = 0;
+  let constValue = 0;
+  do {
+    if (wasmBuffer.length < offset + 1) return null;
+    byte = wasmBuffer[offset];
+    offset += 1;
+    constValue |= (byte & 0x7f) << shift;
+    shift += 7;
+  } while (byte & 0x80);
+  if (constValue !== 0) return null;
+
+  if (wasmBuffer.length < offset + 1) return null;
+  if (wasmBuffer[offset] !== WASM_OPCODE_END) return null;
+  offset += 1;
+
+  // Read Payload Size (LEB128)
+  let payloadSize = 0;
+  shift = 0;
+  do {
+    if (wasmBuffer.length < offset + 1) return null;
+    byte = wasmBuffer[offset];
+    offset += 1;
+    payloadSize |= (byte & 0x7f) << shift;
+    shift += 7;
+  } while (byte & 0x80);
+
+  if (wasmBuffer.length < offset + payloadSize) return null;
+
+  return wasmBuffer.slice(offset, offset + payloadSize);
+}
+const AES_GCM_IV_LENGTH = 12;
+const AES_GCM_TAG_LENGTH = 16;
+
 const STEALTH_MAGIC_SERVER = new Uint8Array([0xCA, 0xFE, 0xBA, 0xBE]);
-const STEALTH_VER = 0x06; // Версия протокола Stealth-Transport
+const STEALTH_VER = 0x09; // Версия протокола Stealth-Transport
 const STEALTH_PAD_MIN = 8;
 const STEALTH_PAD_MAX = 128;
 // Bimodal Traffic Shaping parameters
@@ -46,8 +207,6 @@ const DH_PRIME = Buffer.from("ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129
 const DH_GENERATOR = Buffer.from("02", "hex");
 
 // RSA Key Pair for Handshake Protection (SERVER SIDE)
-// In a real application, these would be loaded from secure storage.
-// For demonstration, we'll generate them once or use hardcoded ones.
 let serverRsaKeyPair;
 
 function generateRsaKeyPair() {
@@ -83,43 +242,38 @@ function _stealthRandBytes(n) {
   return crypto.randomBytes(n);
 }
 
-// XOR-поток: шифрует/дешифрует Buffer с rolling-счётчиком
-function _stealthXor(buf, key, counter) {
-  const out = Buffer.alloc(buf.length);
-  for (let i = 0; i < buf.length; i++) {
-    // Добавляем counter для rolling-эффекта — каждый пакет уникален
-    out[i] = buf[i] ^ key[(counter + i) % 32] ^ ((counter >> 8) & 0xFF) ^ (i & 0xFF);
-  }
-  return out;
+// AES-GCM шифрование/дешифрование
+async function _stealthEncryptAESGCM(payload, key) {
+  const iv = crypto.randomBytes(AES_GCM_IV_LENGTH);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(payload), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return { iv, encrypted, authTag };
+}
+
+async function _stealthDecryptAESGCM(encryptedPayload, key, iv, authTag) {
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(authTag);
+  const decrypted = Buffer.concat([decipher.update(encryptedPayload), decipher.final()]);
+  return decrypted;
 }
 
 // Упаковать JSON-объект в Stealth-фрейм
-function stealthEncode(obj, key, counter) {
+async function stealthEncode(obj, key) {
   const jsonBuf = Buffer.from(JSON.stringify(obj), "utf8");
 
-  // Случайный padding
+  // Динамический padding внутри зашифрованного блока
   const randomPadLen = STEALTH_PAD_MIN + Math.floor(Math.random() * (STEALTH_PAD_MAX - STEALTH_PAD_MIN));
-  const randomPadding = _stealthRandBytes(randomPadLen);
+  const padding = _stealthRandBytes(randomPadLen);
+  const paddedPayload = Buffer.concat([jsonBuf, padding]);
 
-  // Маскируем magic XOR с первыми байтами ключа
-  const magic = Buffer.alloc(4);
-  for (let i = 0; i < 4; i++) magic[i] = STEALTH_MAGIC_SERVER[i] ^ key[i] ^ STEALTH_VER;
+  // Шифруем payload AES-GCM
+  const { iv, encrypted, authTag } = await _stealthEncryptAESGCM(paddedPayload, key);
 
-  // Длина padding (2 байта LE), тоже XOR'd
-  const padLenBuf = Buffer.alloc(2);
-  padLenBuf.writeUInt16LE(randomPadLen, 0);
-  padLenBuf[0] ^= key[4];
-  padLenBuf[1] ^= key[5];
+  // Собираем фрейм: IV + Auth Tag + Encrypted Payload
+  let rawFrame = Buffer.concat([iv, authTag, encrypted]);
 
-  // Шифруем payload XOR-потоком
-  const encPayload = _stealthXor(jsonBuf, key, counter);
-
-  // Собираем фрейм без финального padding'а
-  const rawFrame = Buffer.concat([magic, padLenBuf, randomPadding, encPayload]);
-
-  // Traffic Shaping: Дополняем до фиксированного размера
-  
-  // Dynamic Traffic Shaping (Bimodal Distribution)
+  // Dynamic Traffic Shaping (Bimodal Distribution) - apply to the *entire* frame after encryption
   let targetSize;
   if (Math.random() < STEALTH_BIMODAL_LARGE_PROB) {
     targetSize = STEALTH_BIMODAL_LARGE.min + Math.floor(Math.random() * (STEALTH_BIMODAL_LARGE.max - STEALTH_BIMODAL_LARGE.min));
@@ -130,36 +284,37 @@ function stealthEncode(obj, key, counter) {
   if (rawFrame.length < targetSize) {
     const additionalPadLen = targetSize - rawFrame.length;
     const additionalPadding = _stealthRandBytes(additionalPadLen);
-    return Buffer.concat([rawFrame, additionalPadding]);
+    rawFrame = Buffer.concat([rawFrame, additionalPadding]);
+  } else if (rawFrame.length > targetSize) {
+    rawFrame = rawFrame.slice(0, targetSize);
   }
-  return rawFrame;
+
+  // Оборачиваем в WASM Data Section
+  return wrapInWasmDataSection(rawFrame);
 }
 
 // Распаковать Stealth-фрейм обратно в объект
-function stealthDecode(buf, key, counter) {
-  // Сначала убираем дополнительный padding от Traffic Shaping
-  const originalBuf = buf; // In v5 we read dynamically
+async function stealthDecode(buf, key) {
+  const unwrapped = unwrapFromWasmDataSection(buf);
+  if (!unwrapped) return null;
 
-  if (originalBuf.length < 6) return null;
+  if (unwrapped.length < AES_GCM_IV_LENGTH + AES_GCM_TAG_LENGTH) return null;
 
-  // Проверяем magic
-  const magicCheck = Buffer.alloc(4);
-  for (let i = 0; i < 4; i++) magicCheck[i] = originalBuf[i] ^ key[i] ^ STEALTH_VER;
-  if (!magicCheck.equals(STEALTH_MAGIC_SERVER)) return null; // Should be STEALTH_MAGIC_CLIENT if client-side
-
-  // Читаем длину padding
-  const padLenBuf = Buffer.from([originalBuf[4] ^ key[4], originalBuf[5] ^ key[5]]);
-  const padLen = padLenBuf.readUInt16LE(0);
-
-  if (originalBuf.length < 6 + padLen) return null;
-
-  // Расшифровываем payload
-  const encPayload = originalBuf.slice(6 + padLen);
-  const jsonBuf = _stealthXor(encPayload, key, counter);
+  const iv = unwrapped.slice(0, AES_GCM_IV_LENGTH);
+  const authTag = unwrapped.slice(AES_GCM_IV_LENGTH, AES_GCM_IV_LENGTH + AES_GCM_TAG_LENGTH);
+  const encryptedPayload = unwrapped.slice(AES_GCM_IV_LENGTH + AES_GCM_TAG_LENGTH);
 
   try {
+    const paddedPayload = await _stealthDecryptAESGCM(encryptedPayload, key, iv, authTag);
+    // Удаляем padding
+    let jsonEnd = paddedPayload.length - 1;
+    while (jsonEnd >= 0 && paddedPayload[jsonEnd] === 0) {
+      jsonEnd--;
+    }
+    const jsonBuf = paddedPayload.slice(0, jsonEnd + 1);
     return JSON.parse(jsonBuf.toString("utf8"));
-  } catch {
+  } catch (e) {
+    console.error("[Stealth] Decryption error:", e.message);
     return null;
   }
 }
@@ -417,6 +572,36 @@ const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
 const MAX_CONNS_PER_IP = 8;
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ── ОПТИМИЗАЦИИ ДЛЯ ПЛОХОГО ИНТЕРНЕТА ────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Heartbeat: короткий таймаут + активный ping/pong для быстрого обнаружения обрыва
+// На 2G/3G соединение может "зависнуть" без явного закрытия сокета
+const HEARTBEAT_TIMEOUT = 90_000;    // 90 секунд — если нет pong, закрываем
+const HEARTBEAT_INTERVAL = 30_000;   // ping каждые 30 секунд
+const WS_PING_TIMEOUT = 20_000;      // ждём pong 20 секунд
+
+// ─── Утилита: gzip-сжатие буфера ─────────────────────────────────────────────
+function gzipBuffer(buf) {
+  return new Promise((resolve, reject) => {
+    zlib.gzip(buf, { level: zlib.constants.Z_BEST_SPEED }, (err, result) => {
+      if (err) reject(err);
+      else resolve(result);
+    });
+  });
+}
+
+// ─── Утилита: gunzip буфера ───────────────────────────────────────────────────
+function gunzipBuffer(buf) {
+  return new Promise((resolve, reject) => {
+    zlib.gunzip(buf, (err, result) => {
+      if (err) reject(err);
+      else resolve(result);
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ── HTTP-СЕРВЕР (совмещает Health-check + Stealth HTTP Fallback) ──────────────
 // Render требует один HTTP-порт. Мы поднимаем HTTP на HEALTH_PORT,
 // а WebSocket — на PORT. HTTP-сервер обрабатывает:
@@ -428,21 +613,41 @@ const MAX_CONNS_PER_IP = 8;
 
 const STATS_TOKEN = process.env.STATS_TOKEN || '';
 
-// Буфер HTTP-fallback сообщений: peerId → [{obj, ts}]
+// Буфер HTTP-fallback сообщений: peerId → [{obj, ts, priority}]
 // Сервер складывает сюда исходящие сообщения для клиентов без WS
 const httpFallbackQueues = new Map();
+
+// Приоритеты сообщений (меньше = важнее)
+const MSG_PRIORITY = {
+  'registered': 0,
+  'incoming-msg': 1,
+  'msg-delivered': 2,
+  'msg-read': 2,
+  'file-available': 3,
+  'file-upload-complete': 3,
+  'presence': 5,
+  'pong': 4,
+  'default': 10
+};
+
+function getMsgPriority(obj) {
+  return MSG_PRIORITY[obj.type] !== undefined ? MSG_PRIORITY[obj.type] : MSG_PRIORITY['default'];
+}
 
 function httpFallbackEnqueue(peerId, obj) {
   if (!httpFallbackQueues.has(peerId)) httpFallbackQueues.set(peerId, []);
   const q = httpFallbackQueues.get(peerId);
-  q.push({ obj, ts: Date.now() });
-  // Не копим больше 200 сообщений
-  if (q.length > 200) q.splice(0, q.length - 200);
+  const priority = getMsgPriority(obj);
+  q.push({ obj, ts: Date.now(), priority });
+  // Сортируем по приоритету (важные — первыми)
+  q.sort((a, b) => a.priority - b.priority);
+  // Не копим больше 500 сообщений (увеличено для плохого интернета)
+  if (q.length > 500) q.splice(500);
 }
 
-// Очистка старых HTTP-fallback буферов (старше 5 минут)
+// Очистка старых HTTP-fallback буферов (старше 10 минут)
 setInterval(() => {
-  const cutoff = Date.now() - 5 * 60 * 1000;
+  const cutoff = Date.now() - 10 * 60 * 1000;
   for (const [pid, q] of httpFallbackQueues) {
     const filtered = q.filter(x => x.ts > cutoff);
     if (filtered.length === 0) httpFallbackQueues.delete(pid);
@@ -464,7 +669,7 @@ const healthServer = http.createServer(async (req, res) => {
   // ── CORS для браузера ──
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Seq, X-Client-Public-Key');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Seq, X-Client-Public-Key, Accept-Encoding');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -474,7 +679,6 @@ const healthServer = http.createServer(async (req, res) => {
   // ── Health-check ──
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    // Имитируем обычный веб-сервер
     res.end('OK');
     return;
   }
@@ -488,7 +692,12 @@ const healthServer = http.createServer(async (req, res) => {
     }
     const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM events').get().cnt;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ activeConnections: peers.size, queuedEvents: eventCount }));
+    res.end(JSON.stringify({
+      activeConnections: peers.size,
+      queuedEvents: eventCount,
+      httpFallbackClients: httpFallbackQueues.size,
+      uptime: process.uptime()
+    }));
     return;
   }
 
@@ -555,125 +764,198 @@ function getRandomElement(arr) {
     return serveFakeSite(res);
   }
 
+  // ── Stealth Init: обрабатываем все validPaths для POST ──
   if (validPaths.includes(req.url) && req.method === 'POST') {
+    // Определяем тип запроса по наличию X-Session-Id или Cookie _ga
+    const sid = getCookieSid(req) || req.headers['x-session-id'];
+    const existingSess = sid ? stealthSessions.get(sid) : null;
+
+    // Если сессия уже есть — это HTTP fallback poll
+    if (existingSess) {
+      try {
+        const body = await readBody(req);
+        const decoded = await stealthDecode(body, existingSess.key);
+        if (!decoded) {
+          res.writeHead(400);
+          return res.end();
+        }
+
+        existingSess.rxCounter = (existingSess.rxCounter || 0) + body.length;
+
+        // Создаём виртуальный WS-объект для HTTP-клиентов
+        const responseBuffer = [];
+        const virtualWs = {
+          readyState: WebSocket.OPEN,
+          _isHttpFallback: true,
+          _peerId: null,
+          _responseBuffer: responseBuffer,
+          _stealthKey: existingSess.key,
+          _stealthTxCounter: existingSess.txCounter || 0,
+          send(jsonStr) {
+            try {
+              const obj = JSON.parse(jsonStr);
+              responseBuffer.push(obj);
+            } catch(e) {}
+          }
+        };
+
+        // Если у нас есть peerId из сессии — добавляем накопленные сообщения
+        if (existingSess.peerId) {
+          const q = httpFallbackQueues.get(existingSess.peerId) || [];
+          for (const item of q) responseBuffer.push(item.obj);
+          httpFallbackQueues.delete(existingSess.peerId);
+        }
+
+        // Обрабатываем входящее сообщение
+        await handleMessage(virtualWs, decoded, sid);
+
+        // Если зарегистрировался — запоминаем peerId в сессии
+        if (virtualWs._peerId) existingSess.peerId = virtualWs._peerId;
+
+        // Кодируем все ответы в один бинарный фрейм
+        const encoded = await stealthEncode({ batch: responseBuffer }, existingSess.key);
+
+        // ── Сжатие ответа gzip для экономии трафика на 2G/3G ──
+        const acceptEncoding = req.headers['accept-encoding'] || '';
+        let responseData = encoded;
+        let contentEncoding = null;
+        if (acceptEncoding.includes('gzip') && encoded.length > 512) {
+          try {
+            responseData = await gzipBuffer(encoded);
+            contentEncoding = 'gzip';
+          } catch(e) {
+            responseData = encoded;
+          }
+        }
+
+        const headers = {
+          'Content-Type': 'application/wasm',
+          'Content-Length': responseData.length,
+          'Connection': 'keep-alive',
+          'X-Stealth-Version': STEALTH_VER,
+          'X-Content-Type-Options': 'nosniff',
+          'Cache-Control': 'no-store',
+        };
+        if (contentEncoding) headers['Content-Encoding'] = contentEncoding;
+
+        res.writeHead(200, headers);
+        res.end(responseData);
+      } catch(e) {
+        console.error('[Stealth-HTTP] Poll error:', e.message);
+        res.writeHead(500);
+        res.end();
+      }
+      return;
+    }
+
+    // Нет сессии — это Stealth Init (DH key exchange)
     try {
-      const encryptedClientPublicKeyB64 = req.headers['x-client-public-key'];
-      if (!encryptedClientPublicKeyB64) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing X-Client-Public-Key header' }));
+      const body = await readBody(req);
+      let parsedBody;
+      try {
+        parsedBody = JSON.parse(body.toString("utf8"));
+      } catch(e) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Invalid JSON body" }));
         return;
       }
 
-      // Decrypt client's DH public key using server's RSA private key
-      const encryptedClientPublicKey = Buffer.from(encryptedClientPublicKeyB64, 'base64');
-      const decryptedClientPublicKey = crypto.privateDecrypt(
-        { key: serverRsaKeyPair.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
-        encryptedClientPublicKey
-      );
-      const clientPublicKey = decryptedClientPublicKey; // This is the actual DH public key
+      // Поддерживаем оба формата: clientPublicKeyB64 (старый) и payload (новый от клиента)
+      const clientPublicKeyB64 = parsedBody.clientPublicKeyB64 || parsedBody.payload;
+      if (!clientPublicKeyB64) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Missing clientPublicKeyB64 in body" }));
+        return;
+      }
 
-      const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
-      const serverPublicKey = dh.generateKeys();
-      const sharedSecret = dh.computeSecret(clientPublicKey);
+      // ИСПРАВЛЕНИЕ: Поддерживаем ECDH P-256 (новый клиент) и классический DH (старый)
+      // Клиент отправляет SPKI-encoded ECDH P-256 public key в base64
+      const clientPublicKeyBuf = Buffer.from(clientPublicKeyB64, "base64");
+      const newSid = crypto.randomBytes(16).toString('hex');
+      let sessionKey;
+      let serverPublicKeyB64 = null;
 
-      const sid = crypto.randomBytes(16).toString('hex'); // Session ID
-      const sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32); // 32-byte key
+      // Пробуем ECDH P-256 (новый протокол)
+      let ecdhSuccess = false;
+      try {
+        // Генерируем серверную ECDH пару
+        const serverEcdh = crypto.createECDH('prime256v1'); // P-256
+        serverEcdh.generateKeys();
 
-      stealthSessions.set(sid, { key: sessionKey, txCounter: 0, rxCounter: 0, dh: dh, createdAt: Date.now() });
+        // Вычисляем shared secret из клиентского публичного ключа
+        // Клиент отправляет SPKI-encoded ключ — извлекаем raw точку (последние 65 байт)
+        let clientRawKey = clientPublicKeyBuf;
+        // SPKI для P-256 имеет 91 байт: 26 байт заголовка + 65 байт ключа
+        if (clientPublicKeyBuf.length === 91) {
+          clientRawKey = clientPublicKeyBuf.slice(26); // raw uncompressed point
+        } else if (clientPublicKeyBuf.length === 65) {
+          clientRawKey = clientPublicKeyBuf; // уже raw
+        }
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        sid: sid,
-        publicKey: serverPublicKey.toString('base64'),
-        serverRsaPublicKey: serverRsaKeyPair.publicKey // Provide server's RSA public key for client to encrypt
-      }));
-      console.log(`[Stealth-DH] Session ${sid} initialized.`);
+        const sharedSecret = serverEcdh.computeSecret(clientRawKey);
+        sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32);
+
+        // Отправляем серверный публичный ключ в SPKI формате (для совместимости)
+        // ECDH getPublicKey() возвращает raw uncompressed point (65 байт)
+        // Оборачиваем в SPKI: 26-байтовый заголовок P-256 + 65 байт ключа
+        const spkiHeader = Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex');
+        const serverSpki = Buffer.concat([spkiHeader, serverEcdh.getPublicKey()]);
+        serverPublicKeyB64 = serverSpki.toString('base64');
+        ecdhSuccess = true;
+        console.log(`[Stealth-ECDH] P-256 session ${newSid} initialized`);
+      } catch(e) {
+        console.warn('[Stealth-ECDH] P-256 failed, trying classic DH:', e.message);
+      }
+
+      // Fallback: классический DH (старый протокол)
+      if (!ecdhSuccess) {
+        try {
+          const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
+          const serverDhPublicKey = dh.generateKeys();
+          let sharedSecret;
+          try {
+            // Пробуем RSA расшифровку (старый клиент)
+            const decrypted = crypto.privateDecrypt(
+              { key: serverRsaKeyPair.privateKey, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
+              clientPublicKeyBuf
+            );
+            sharedSecret = dh.computeSecret(decrypted);
+          } catch(e2) {
+            // Используем напрямую
+            try { sharedSecret = dh.computeSecret(clientPublicKeyBuf); }
+            catch(e3) { sharedSecret = crypto.randomBytes(32); }
+          }
+          sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32);
+          serverPublicKeyB64 = serverDhPublicKey.toString('base64');
+          console.log(`[Stealth-DH] Classic DH session ${newSid} initialized`);
+        } catch(e) {
+          // Последний fallback: случайный ключ (sid-based на клиенте)
+          sessionKey = crypto.randomBytes(32);
+          console.warn(`[Stealth] Using random key for session ${newSid}`);
+        }
+      }
+
+      stealthSessions.set(newSid, {
+        key: sessionKey,
+        txCounter: 0,
+        rxCounter: 0,
+        createdAt: Date.now(),
+        peerId: parsedBody.client_id || null
+      });
+
+      const responseBody = { sid: newSid };
+      if (serverPublicKeyB64) responseBody.publicKey = serverPublicKeyB64;
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'no-store',
+        'Vary': 'Accept-Encoding',
+      });
+      res.end(JSON.stringify(responseBody));
     } catch (e) {
       console.error("[Stealth-DH] Init error:", e);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Server error' }));
-    }
-    return;
-  }
-
-  // ── Stealth Poll: HTTP fallback для заблокированных WS ──
-  // POST /api/v1/metrics/collect
-  // Headers: X-Session-Id: <sid>, X-Seq: <counter>
-  // Body: бинарный Stealth-фрейм с JSON-сообщением
-  // Response: бинарный Stealth-фрейм (массив ответных сообщений)
-  if (validPaths.includes(req.url) && req.method === 'POST') {
-    const sid = getCookieSid(req) || req.headers['x-session-id'];
-    const seq = parseInt(req.headers['x-seq'] || '0', 10);
-    const sess = stealthSessions.get(sid);
-
-    if (!sess) {
-      // Имитируем 404 обычного сайта
-      res.writeHead(404, { 'Content-Type': 'text/html' });
-      return res.end('<html><body>Not found</body></html>');
-    }
-
-    try {
-      const body = await readBody(req);
-      const decoded = stealthDecode(body, sess.key, seq);
-      if (!decoded) {
-        res.writeHead(400);
-        return res.end();
-      }
-
-      // Обновляем счётчик приёма
-      sess.rxCounter = seq + body.length; // This counter logic needs review, should be based on payload length not frame length
-
-      // Создаём виртуальный WS-объект для HTTP-клиентов
-      // Он накапливает ответы в буфер вместо отправки по WS
-      const responseBuffer = [];
-      const virtualWs = {
-        readyState: WebSocket.OPEN,
-        _isHttpFallback: true,
-        _peerId: null,
-        _responseBuffer: responseBuffer,
-        _stealthKey: sess.key, // Provide stealth key for virtual WS
-        _stealthTxCounter: sess.txCounter, // Provide txCounter
-        send(jsonStr) {
-          try {
-            const obj = JSON.parse(jsonStr);
-            responseBuffer.push(obj);
-          } catch(e) {}
-        }
-      };
-
-      // Если у нас есть peerId из сессии — добавляем накопленные сообщения
-      if (sess.peerId) {
-        const q = httpFallbackQueues.get(sess.peerId) || [];
-        for (const item of q) responseBuffer.push(item.obj);
-        httpFallbackQueues.delete(sess.peerId);
-      }
-
-      // Обрабатываем входящее сообщение
-      await handleMessage(virtualWs, decoded, sid);
-
-      // Если зарегистрировался — запоминаем peerId в сессии
-      if (virtualWs._peerId) sess.peerId = virtualWs._peerId;
-
-      // Кодируем все ответы в один бинарный фрейм
-      const responseJson = JSON.stringify({ batch: responseBuffer });
-      const encoded = stealthEncode({ batch: responseBuffer }, sess.key, sess.txCounter);
-      sess.txCounter += responseJson.length;
-
-      res.writeHead(200, {
-        'Content-Type': 'application/wasm',
-        'Content-Length': encoded.length,
-        'X-Content-Type-Options': 'nosniff',
-        'Cache-Control': 'no-store',
-        'User-Agent': getRandomElement(USER_AGENTS),
-        'Accept-Language': getRandomElement(ACCEPT_LANGUAGES),
-        'Referer': getRandomElement(REFERERS),
-
-      });
-      res.end(encoded);
-    } catch(e) {
-      console.error('[Stealth-HTTP] Poll error:', e.message);
-      res.writeHead(500);
-      res.end();
     }
     return;
   }
@@ -683,6 +965,17 @@ function getRandomElement(arr) {
   res.end('<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>');
 });
 
+// ── TCP keepalive на HTTP-сервере для быстрого обнаружения обрыва ──
+healthServer.on('connection', (socket) => {
+  // Включаем TCP keepalive: начинаем через 30с, интервал 10с, 3 попытки
+  socket.setKeepAlive(true, 30000);
+  // Таймаут неактивного соединения — 120 секунд
+  socket.setTimeout(120000);
+  socket.on('timeout', () => {
+    socket.destroy();
+  });
+});
+
 healthServer.listen(HEALTH_PORT, () => {
   console.log(`[Health+Stealth] listening on port ${HEALTH_PORT}`);
 });
@@ -690,7 +983,25 @@ healthServer.listen(HEALTH_PORT, () => {
 // ─── WebSocket Server ─────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({
   noServer: true, // Attach to healthServer later
-  maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
+  // ── Оптимизация для плохого интернета: сжатие WS фреймов ──
+  // perMessageDeflate значительно уменьшает размер передаваемых данных
+  // Особенно эффективно для JSON-сообщений (сжатие до 70-80%)
+  perMessageDeflate: {
+    zlibDeflateOptions: {
+      chunkSize: 1024,
+      memLevel: 7,
+      level: 3 // Быстрое сжатие (не максимальное) для экономии CPU
+    },
+    zlibInflateOptions: {
+      chunkSize: 10 * 1024
+    },
+    clientNoContextTakeover: true,  // Экономим память на клиенте
+    serverNoContextTakeover: true,  // Экономим память на сервере
+    serverMaxWindowBits: 10,        // Меньше памяти, чуть хуже сжатие
+    concurrencyLimit: 10,
+    threshold: 512 // Сжимаем только если больше 512 байт
+  },
+  maxPayload: 64 * 1024 * 1024, // 64 МБ — разумный лимит (было 1 ГБ!)
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -708,7 +1019,7 @@ const wss = new WebSocket.Server({
 const peers = new Map();
 const activeFetchers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
+const pingTimers = new Map(); // Таймеры ping для каждого клиента
 
 // Rate limiting
 const rateLimits = new Map();
@@ -763,13 +1074,13 @@ function send(ws, obj) {
     } catch(e) {
       console.warn("Stealth encode error, fallback to JSON:", e);
       // Fallback на JSON если что-то пошло не так
-      ws.send(JSON.stringify(obj));
+      try { ws.send(JSON.stringify(obj)); } catch(e2) {}
     }
     return;
   }
 
   // Обычный JSON (клиент без Stealth)
-  ws.send(JSON.stringify(obj));
+  try { ws.send(JSON.stringify(obj)); } catch(e) {}
 }
 
 function flushPriorityQueue(userId) {
@@ -789,9 +1100,56 @@ function broadcastPresence(peerId, isOnline) {
   for(const [, ws] of peers) send(ws, msg);
 }
 
+// ── Heartbeat с активным ping/pong ──
+// На плохом интернете TCP соединение может "зависнуть" без явного закрытия.
+// Активный ping/pong позволяет быстро обнаружить это и переподключиться.
 function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
-  heartbeats.set(peerId, setTimeout(() => { peers.get(peerId)?.close(); }, HEARTBEAT_TIMEOUT));
+  heartbeats.set(peerId, setTimeout(() => {
+    const ws = peers.get(peerId);
+    if(ws) {
+      console.log(`[Heartbeat] Timeout for ${peerId}, closing connection`);
+      ws.terminate(); // terminate() вместо close() — немедленно закрываем
+    }
+  }, HEARTBEAT_TIMEOUT));
+}
+
+function startPingTimer(peerId) {
+  stopPingTimer(peerId);
+  const timer = setInterval(() => {
+    const ws = peers.get(peerId);
+    if(!ws || ws.readyState !== WebSocket.OPEN) {
+      stopPingTimer(peerId);
+      return;
+    }
+    // Отправляем WebSocket ping frame (не JSON ping, а нативный WS ping)
+    ws.ping(Buffer.from('k'), false, (err) => {
+      if(err) {
+        console.log(`[Ping] Error for ${peerId}:`, err.message);
+        stopPingTimer(peerId);
+      }
+    });
+    // Если pong не пришёл за WS_PING_TIMEOUT — закрываем
+    const pongTimeout = setTimeout(() => {
+      const currentWs = peers.get(peerId);
+      if(currentWs && currentWs.readyState === WebSocket.OPEN && !currentWs._lastPong) {
+        console.log(`[Ping] No pong from ${peerId}, terminating`);
+        currentWs.terminate();
+      }
+      if(currentWs) currentWs._lastPong = false;
+    }, WS_PING_TIMEOUT);
+    if(ws._pongTimeout) clearTimeout(ws._pongTimeout);
+    ws._pongTimeout = pongTimeout;
+    ws._lastPong = false;
+  }, HEARTBEAT_INTERVAL);
+  pingTimers.set(peerId, timer);
+}
+
+function stopPingTimer(peerId) {
+  if(pingTimers.has(peerId)) {
+    clearInterval(pingTimers.get(peerId));
+    pingTimers.delete(peerId);
+  }
 }
 
 function enqueueEvent(recipientId, type, payload) {
@@ -824,24 +1182,18 @@ function removeMember(groupId, peerId) {
 // ── ОБРАБОТЧИК СООБЩЕНИЙ (общий для WS и HTTP fallback) ──────────────────────
 // ═══════════════════════════════════════════════════════════════════════════
 async function handleMessage(ws, data, sessionId) {
-  // Для WS-клиентов rate-limit проверяется в onmessage
-  // Для HTTP-fallback — проверяем отдельно (лимит мягче: 60/сек)
-
-  // Получаем myId из контекста ws
   let myId = ws._myId || null;
 
   if(myId) resetHeartbeat(myId);
 
   // ── Stealth-handshake: клиент сообщает свой sessionId ──
-  // { type: 'stealth-hello', sid: '...' }
-  // После этого все исходящие сообщения этому WS шифруются
   if(data.type === 'stealth-hello') {
     const sid = data.sid;
     const sess = stealthSessions.get(sid);
     if(sess) {
       ws._stealthKey = sess.key;
-      ws._stealthTxCounter = sess.txCounter; // Use session's current counter
-      ws._stealthRxCounter = sess.rxCounter; // Use session's current counter
+      ws._stealthTxCounter = sess.txCounter || 0;
+      ws._stealthRxCounter = sess.rxCounter || 0;
       ws._stealthSid = sid;
       console.log(`[Stealth] WS client activated stealth mode, sid=${sid}`);
     }
@@ -864,23 +1216,37 @@ async function handleMessage(ws, data, sessionId) {
     const existingWs = peers.get(peerId);
     if (existingWs && existingWs !== ws) {
       console.log(`Closing old connection for ${peerId}`);
-      existingWs.close(1000, 'New connection established');
+      try { existingWs.terminate(); } catch(e) {}
     }
 
     ws._myId = peerId;
+    if(ws._isHttpFallback) ws._peerId = peerId;
     peers.set(peerId, ws);
     resetHeartbeat(peerId);
+    if(!ws._isHttpFallback) startPingTimer(peerId);
     broadcastPresence(peerId, true);
     console.log(`Peer ${peerId} registered.`);
 
     // Отправляем подтверждение регистрации
     send(ws, { type: "registered", peerId: peerId });
 
-    // Отправляем все накопленные события
+    // ── Батчинг событий при reconnect ──
+    // Отправляем все накопленные события одним батчем для экономии round-trips
     const events = stmtGetEvents.all(peerId);
-    for (const event of events) {
-      send(ws, JSON.parse(event.payload));
-      stmtDeleteEvent.run(event.id);
+    if(events.length > 0) {
+      // Группируем события в батч (до 50 за раз)
+      const BATCH_SIZE = 50;
+      for(let i = 0; i < events.length; i += BATCH_SIZE) {
+        const batch = events.slice(i, i + BATCH_SIZE);
+        for(const event of batch) {
+          send(ws, JSON.parse(event.payload));
+          stmtDeleteEvent.run(event.id);
+        }
+        // Небольшая пауза между батчами чтобы не перегружать медленное соединение
+        if(i + BATCH_SIZE < events.length) {
+          await new Promise(r => setTimeout(r, 50));
+        }
+      }
     }
     flushPriorityQueue(peerId);
 
@@ -895,7 +1261,7 @@ async function handleMessage(ws, data, sessionId) {
 
   // ── Ping/Pong ─────────────────────────────
   if (data.type === "ping") {
-    send(ws, { type: "pong" });
+    send(ws, { type: "pong", ts: Date.now() });
     return;
   }
 
@@ -910,11 +1276,12 @@ async function handleMessage(ws, data, sessionId) {
       send(ws, { type: "msg-delivered", msgId: data.msgId, by: targetPeerId });
     } else {
       // Если получатель оффлайн, ставим в очередь
-      enqueueEvent(targetPeerId, 'incoming-msg', { from: ws._myId, msgId: data.msgId, payload: data.payload });
-      // Если это HTTP-fallback, то также добавляем в очередь для него
+      enqueueEvent(targetPeerId, 'incoming-msg', { type: 'incoming-msg', from: ws._myId, msgId: data.msgId, payload: data.payload });
       if (targetWs && targetWs._isHttpFallback) {
         httpFallbackEnqueue(targetPeerId, { type: "incoming-msg", from: ws._myId, msgId: data.msgId, payload: data.payload });
       }
+      // Отправляем ack отправителю что сообщение принято сервером (queued)
+      send(ws, { type: "msg-queued", msgId: data.msgId, target: targetPeerId });
     }
     return;
   }
@@ -929,8 +1296,17 @@ async function handleMessage(ws, data, sessionId) {
       const senderWs = peers.get(acked.sender);
       if (senderWs && senderWs.readyState === WebSocket.OPEN) {
         send(senderWs, { type: "msg-read", msgId: msgId, by: ws._myId });
+      } else if(acked.sender) {
+        enqueueEvent(acked.sender, 'msg-read', { type: 'msg-read', msgId, by: ws._myId });
       }
     }
+    return;
+  }
+
+  // ── Подтверждение события ─────────────────
+  if (data.type === "ack-event") {
+    const { eventId } = data;
+    if(eventId) stmtDeleteById.run(eventId);
     return;
   }
 
@@ -951,7 +1327,7 @@ async function handleMessage(ws, data, sessionId) {
     if (targetWs && targetWs.readyState === WebSocket.OPEN) {
       send(targetWs, { type: 'file-available', fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
     } else {
-      enqueueEvent(recipientId, 'file-available', { fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
+      enqueueEvent(recipientId, 'file-available', { type: 'file-available', fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
       if (targetWs && targetWs._isHttpFallback) {
         httpFallbackEnqueue(recipientId, { type: 'file-available', fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
       }
@@ -974,7 +1350,7 @@ async function handleMessage(ws, data, sessionId) {
         if (targetWs && targetWs.readyState === WebSocket.OPEN) {
           send(targetWs, { type: 'file-upload-complete', fileId });
         } else {
-          enqueueEvent(header.recipient_id, 'file-upload-complete', { fileId });
+          enqueueEvent(header.recipient_id, 'file-upload-complete', { type: 'file-upload-complete', fileId });
           if (targetWs && targetWs._isHttpFallback) {
             httpFallbackEnqueue(header.recipient_id, { type: 'file-upload-complete', fileId });
           }
@@ -985,8 +1361,38 @@ async function handleMessage(ws, data, sessionId) {
     return;
   }
 
+  // ── Батчевая отправка чанков (оптимизация для плохого интернета) ──
+  if (data.type === 'store-chunks') {
+    const { fileId, chunks } = data;
+    if(!Array.isArray(chunks) || !fileId) return;
+    const header = stmtGetHeader.get(fileId);
+    if(!header) { send(ws, { type: 'store-chunks-error', fileId, msg: 'Header not found' }); return; }
+    // Вставляем все чанки батчем
+    const insertBatch = db.transaction((chunks) => {
+      for(const chunk of chunks) {
+        stmtInsertChunk.run(fileId, chunk.index, chunk.data, Date.now());
+      }
+    });
+    try {
+      insertBatch(chunks);
+    } catch(e) {
+      console.error('[File] Batch insert error:', e.message);
+    }
+    const { cnt } = stmtCountChunks.get(fileId);
+    send(ws, { type: 'file-chunks-update', fileId, chunksReady: cnt, totalChunks: header.total_chunks });
+    if(cnt === header.total_chunks) {
+      const targetWs = peers.get(header.recipient_id);
+      if(targetWs && targetWs.readyState === WebSocket.OPEN) {
+        send(targetWs, { type: 'file-upload-complete', fileId });
+      } else {
+        enqueueEvent(header.recipient_id, 'file-upload-complete', { type: 'file-upload-complete', fileId });
+      }
+    }
+    return;
+  }
+
   if (data.type === 'fetch-file') {
-    const { fileId } = data;
+    const { fileId, fromIndex } = data;
     const header = stmtGetHeader.get(fileId);
     if (!header) {
       send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' });
@@ -1001,11 +1407,19 @@ async function handleMessage(ws, data, sessionId) {
     // Отправляем заголовок файла
     send(ws, { type: 'file-data-header', fileId, name: header.name, mimeType: header.mime_type, size: header.size, totalChunks: header.total_chunks, caption: header.caption, thumb: header.thumb });
 
-    // Отправляем чанки
-    for (let i = 0; i < header.total_chunks; i++) {
+    // ── Возобновляемая загрузка: начинаем с fromIndex ──
+    // Если клиент уже скачал часть чанков — не отправляем их повторно
+    const startIndex = (typeof fromIndex === 'number' && fromIndex > 0) ? fromIndex : 0;
+
+    // Отправляем чанки с небольшой паузой между ними для медленных соединений
+    for (let i = startIndex; i < header.total_chunks; i++) {
       const chunk = db.prepare('SELECT data FROM file_chunks WHERE file_id=? AND chunk_index=?').get(fileId, i);
       if (chunk) {
         send(ws, { type: 'file-data-chunk', fileId, chunkIndex: i, data: chunk.data });
+        // Микро-пауза каждые 10 чанков чтобы не перегружать буфер медленного соединения
+        if((i - startIndex) % 10 === 9 && i < header.total_chunks - 1) {
+          await new Promise(r => setTimeout(r, 10));
+        }
       } else {
         console.error(`Missing chunk ${i} for file ${fileId}`);
         send(ws, { type: 'file-fetch-error', fileId, msg: `Missing chunk ${i}` });
@@ -1017,7 +1431,6 @@ async function handleMessage(ws, data, sessionId) {
 
   if (data.type === 'ack-file') {
     const { fileId } = data;
-    // Удаляем файл из очереди получателя
     stmtDeleteFileAvail.run(ws._myId, fileId);
     // Уведомляем отправителя, что файл доставлен
     const header = stmtGetHeader.get(fileId);
@@ -1025,6 +1438,8 @@ async function handleMessage(ws, data, sessionId) {
       const senderWs = peers.get(header.sender_id);
       if (senderWs && senderWs.readyState === WebSocket.OPEN) {
         send(senderWs, { type: 'file-delivered', fileId, recipientId: ws._myId });
+      } else if(header.sender_id) {
+        enqueueEvent(header.sender_id, 'file-delivered', { type: 'file-delivered', fileId, recipientId: ws._myId });
       }
     }
     return;
@@ -1052,6 +1467,8 @@ async function handleMessage(ws, data, sessionId) {
           const memberWs = peers.get(memberId);
           if (memberWs && memberWs.readyState === WebSocket.OPEN) {
             send(memberWs, { type: 'group-member-added', groupId: group.id, peerId: ws._myId });
+          } else {
+            enqueueEvent(memberId, 'group-member-added', { type: 'group-member-added', groupId: group.id, peerId: ws._myId });
           }
         }
       } else {
@@ -1085,7 +1502,7 @@ async function handleMessage(ws, data, sessionId) {
         if (memberWs && memberWs.readyState === WebSocket.OPEN) {
           send(memberWs, { type: 'incoming-group-msg', groupId, from: ws._myId, msgId, payload });
         } else {
-          enqueueEvent(memberId, 'incoming-group-msg', { groupId, from: ws._myId, msgId, payload });
+          enqueueEvent(memberId, 'incoming-group-msg', { type: 'incoming-group-msg', groupId, from: ws._myId, msgId, payload });
           if (memberWs && memberWs._isHttpFallback) {
             httpFallbackEnqueue(memberId, { type: 'incoming-group-msg', groupId, from: ws._myId, msgId, payload });
           }
@@ -1099,7 +1516,6 @@ async function handleMessage(ws, data, sessionId) {
   }
 
   // ── Прочие сообщения (реакции, редактирование, удаление и т.д.) ──
-  // Эти сообщения также должны быть зашифрованы и перенаправлены
   if (data.target) {
     const targetPeerId = data.target;
     const targetWs = peers.get(targetPeerId);
@@ -1119,11 +1535,28 @@ async function handleMessage(ws, data, sessionId) {
 
 wss.on("connection", (ws, req) => {
   console.log("Client connected");
-  ws._myId = null; // Will be set on 'register'
-  ws._stealthKey = null; // Will be set on 'stealth-hello'
+  ws._myId = null;
+  ws._stealthKey = null;
   ws._stealthTxCounter = 0;
   ws._stealthRxCounter = 0;
   ws._stealthSid = null;
+  ws._lastPong = true;
+
+  // ── TCP keepalive на WS-сокете ──
+  if(ws._socket) {
+    ws._socket.setKeepAlive(true, 15000); // keepalive каждые 15 секунд
+    ws._socket.setNoDelay(true);          // отключаем алгоритм Нагла для низкой задержки
+  }
+
+  // Обработка нативного pong (ответ на наш ping)
+  ws.on('pong', () => {
+    ws._lastPong = true;
+    if(ws._pongTimeout) {
+      clearTimeout(ws._pongTimeout);
+      ws._pongTimeout = null;
+    }
+    if(ws._myId) resetHeartbeat(ws._myId);
+  });
 
   ws.on("message", async (message) => {
     if (!checkRateLimit(ws)) {
@@ -1139,17 +1572,17 @@ wss.on("connection", (ws, req) => {
       currentStealthSession = stealthSessions.get(ws._stealthSid);
       if (currentStealthSession) {
         ws._stealthKey = currentStealthSession.key;
-        ws._stealthTxCounter = currentStealthSession.txCounter;
-        ws._stealthRxCounter = currentStealthSession.rxCounter;
+        ws._stealthTxCounter = currentStealthSession.txCounter || 0;
+        ws._stealthRxCounter = currentStealthSession.rxCounter || 0;
       }
     }
 
     if (message instanceof Buffer) {
       // Пробуем декодировать как Stealth-фрейм
       if (ws._stealthKey) {
-        parsedMessage = stealthDecode(message, ws._stealthKey, ws._stealthRxCounter);
+        parsedMessage = await stealthDecode(message, ws._stealthKey);
         if (parsedMessage) {
-          ws._stealthRxCounter += message.length; // Update counter based on raw frame length
+          ws._stealthRxCounter += message.length;
           if (currentStealthSession) currentStealthSession.rxCounter = ws._stealthRxCounter;
         } else {
           // Если не Stealth-фрейм, пробуем как обычный JSON в бинарном буфере
@@ -1174,20 +1607,21 @@ wss.on("connection", (ws, req) => {
     }
   });
 
-  ws.on("close", () => {
-    console.log(`Client ${ws._myId || 'unknown'} disconnected.`);
+  ws.on("close", (code, reason) => {
+    console.log(`Client ${ws._myId || 'unknown'} disconnected. Code: ${code}`);
     if (ws._myId) {
       peers.delete(ws._myId);
       broadcastPresence(ws._myId, false);
       if (heartbeats.has(ws._myId)) clearTimeout(heartbeats.get(ws._myId));
+      stopPingTimer(ws._myId);
     }
-    // Clean up stealth session if it was active for this WS
-    // Note: We don't delete the session immediately, as it might be used by HTTP fallback
-    // A separate cleanup mechanism for old sessions is handled by setInterval.
+    if(ws._pongTimeout) clearTimeout(ws._pongTimeout);
+    rateLimits.delete(ws);
   });
 
   ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
+    console.error("WebSocket error:", error.message);
+    // Не даём необработанной ошибке упасть весь процесс
   });
 });
 
@@ -1202,9 +1636,6 @@ healthServer.on('upgrade', (request, socket, head) => {
     socket.destroy();
   }
 });
-
-// Dummy message store for demonstration
-const messages = [];
 
 // Function to send a message to a specific peer
 function sendMessageToPeer(targetPeerId, message) {
@@ -1221,6 +1652,26 @@ function sendMessageToPeer(targetPeerId, message) {
     }
   }
 }
+
+// ── Graceful shutdown ──
+process.on('SIGTERM', () => {
+  console.log('[Server] SIGTERM received, closing gracefully...');
+  wss.close(() => {
+    healthServer.close(() => {
+      db.close();
+      process.exit(0);
+    });
+  });
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught exception:', err.message, err.stack);
+  // Не падаем при некритических ошибках
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Server] Unhandled rejection:', reason);
+});
 
 // Export for testing or other modules if needed
 module.exports = { healthServer, wss, stealthEncode, stealthDecode, stealthSessions, sendMessageToPeer, serverRsaKeyPair };
