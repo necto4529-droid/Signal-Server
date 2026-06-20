@@ -1,123 +1,14 @@
-const WebSocket = require("ws");
-const http = require("http");
-const url = require("url");
-const { TextEncoder, TextDecoder } = require("util");
-const crypto = require("crypto");
-const Database = require("better-sqlite3");
-const path = require("path");
-const fs = require("fs");
-const https = require("https");
-const { spawn } = require("child_process");
-const os = require("os");
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── STEALTH-TRANSPORT v3 ─────────────────────────────────────────────────
-// Маскировка трафика под случайный бинарный мусор для обхода DPI/ТСПУ.
-//
-// Режимы работы:
-//   1. WebSocket + Stealth-бинарный фрейм (основной)
-//   2. HTTP POST fallback (если WS заблокирован) с мимикрией под аналитику
-//
-// Протокол фрейма (v3):
-//   [4 байта] magic XOR'd  — всегда разные, не детектируемые
-//   [2 байта] pad_len LE   — длина шума (XOR'd)
-//   [pad_len] padding      — случайный мусор
-//   [остаток] payload      — XOR-поток с rolling-ключом
-//
-// Изменения в v3:
-//   - Diffie-Hellman key exchange для безопасного обмена ключами.
-//   - HTTP-пути мимикрируют под запросы аналитики/метрик.
-//   - Случайный джиттер в таймингах HTTP-поллинга (клиент).
-// ═══════════════════════════════════════════════════════════════════════════
-
-const STEALTH_MAGIC_SERVER = new Uint8Array([0xCA, 0xFE, 0xBA, 0xBE]);
-const STEALTH_VER = 0x03; // Версия протокола Stealth-Transport
-const STEALTH_PAD_MIN = 8;
-const STEALTH_PAD_MAX = 128;
-
-// DH key exchange parameters (using a common group for simplicity)
-const DH_PRIME = Buffer.from('ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a163ee8101000000000000000009', 'hex');
-const DH_GENERATOR = Buffer.from('02', 'hex');
-
-// Map для хранения сессионных ключей и счётчиков
-const stealthSessions = new Map(); // sid -> { key, txCounter, rxCounter, dh, peerId, createdAt }
-
-// Генерация случайных байт
-function _stealthRandBytes(n) {
-  return crypto.randomBytes(n);
-}
-
-// XOR-поток: шифрует/дешифрует Buffer с rolling-счётчиком
-function _stealthXor(buf, key, counter) {
-  const out = Buffer.alloc(buf.length);
-  for (let i = 0; i < buf.length; i++) {
-    // Добавляем counter для rolling-эффекта — каждый пакет уникален
-    out[i] = buf[i] ^ key[(counter + i) % 32] ^ ((counter >> 8) & 0xFF) ^ (i & 0xFF);
-  }
-  return out;
-}
-
-// Упаковать JSON-объект в Stealth-фрейм
-function stealthEncode(obj, key, counter) {
-  const jsonBuf = Buffer.from(JSON.stringify(obj), 'utf8');
-
-  // Случайный padding
-  const padLen = STEALTH_PAD_MIN + Math.floor(Math.random() * (STEALTH_PAD_MAX - STEALTH_PAD_MIN));
-  const padding = _stealthRandBytes(padLen);
-
-  // Маскируем magic XOR с первыми байтами ключа
-  const magic = Buffer.alloc(4);
-  for (let i = 0; i < 4; i++) magic[i] = STEALTH_MAGIC_SERVER[i] ^ key[i] ^ STEALTH_VER;
-
-  // Длина padding (2 байта LE), тоже XOR'd
-  const padLenBuf = Buffer.alloc(2);
-  padLenBuf.writeUInt16LE(padLen, 0);
-  padLenBuf[0] ^= key[4];
-  padLenBuf[1] ^= key[5];
-
-  // Шифруем payload XOR-потоком
-  const encPayload = _stealthXor(jsonBuf, key, counter);
-
-  // Собираем фрейм
-  const frame = Buffer.concat([magic, padLenBuf, padding, encPayload]);
-  return frame;
-}
-
-// Распаковать Stealth-фрейм обратно в объект
-function stealthDecode(buf, key, counter) {
-  if (buf.length < 6) return null;
-
-  // Проверяем magic
-  const magicCheck = Buffer.alloc(4);
-  for (let i = 0; i < 4; i++) magicCheck[i] = buf[i] ^ key[i] ^ STEALTH_VER;
-  if (!magicCheck.equals(STEALTH_MAGIC_SERVER)) return null; // Should be STEALTH_MAGIC_CLIENT if client-side
-
-  // Читаем длину padding
-  const padLenBuf = Buffer.from([buf[4] ^ key[4], buf[5] ^ key[5]]);
-  const padLen = padLenBuf.readUInt16LE(0);
-
-  if (buf.length < 6 + padLen) return null;
-
-  // Расшифровываем payload
-  const encPayload = buf.slice(6 + padLen);
-  const jsonBuf = _stealthXor(encPayload, key, counter);
-
-  try {
-    return JSON.parse(jsonBuf.toString('utf8'));
-  } catch {
-    return null;
-  }
-}
-
-// Очистка устаревших сессий (старше 24 часов)
-setInterval(() => {
-  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
-  for (const [sid, sess] of stealthSessions) {
-    if (sess.createdAt < cutoff) stealthSessions.delete(sid);
-  }
-}, 60 * 60 * 1000);
+const WebSocket = require('ws');
+const http = require('http');
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs');
+const https = require('https');
+const { spawn } = require('child_process');
+const os = require('os');
 
 // ─── SQLite WAL ───────────────────────────────────────────────────────────────
+// ОПТИМИЗАЦИЯ 2: WAL-режим — параллельное чтение/запись без блокировок
 const dbPath = path.join(__dirname, 'offline_queue.db');
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -172,9 +63,12 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_file_chunks_file ON file_chunks (file_id);
 `);
 
+// ОПТИМИЗАЦИЯ 2: Миграция — добавляем колонку thumb если её нет (для существующих БД)
 try {
   db.exec(`ALTER TABLE file_headers ADD COLUMN thumb TEXT DEFAULT ''`);
-} catch(e) {}
+} catch(e) {
+  // Колонка уже существует — игнорируем ошибку
+}
 
 // ─── Подготовленные запросы ───────────────────────────────────────────────────
 const stmtInsertEvent     = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
@@ -188,6 +82,7 @@ const stmtAckMsg          = db.prepare(`
 `);
 const stmtDeleteById      = db.prepare(`DELETE FROM events WHERE id=?`);
 
+// ОПТИМИЗАЦИЯ 1: stmtInsertHeader теперь включает поле thumb
 const stmtInsertHeader    = db.prepare(`
   INSERT OR REPLACE INTO file_headers
     (file_id, sender_id, recipient_id, name, size, mime_type, total_chunks, caption, thumb, ts, created_at)
@@ -263,26 +158,41 @@ async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
 
 async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
+    // ── ИДЕАЛЬНАЯ ПЛАВНОСТЬ И ОПТИМАЛЬНЫЙ ВЕС (Telegram-уровень) ──
+    // Переходим на H.264 с жестким контролем FPS и битрейта.
+    // - libx264: лучший кодек для широкой совместимости и контроля.
+    // - -preset veryfast: быстрый, но качественный пресет.
+    // - -profile:v main: широкая совместимость.
+    // - -crf 23: оптимальный баланс качества и размера для 720p.
+    // - -g 30: GOP (Group of Pictures) каждые 30 кадров для лучшей перемотки.
+    // - -keyint_min 30: минимальный интервал между ключевыми кадрами.
+    // - -sc_threshold 0: не создавать ключевые кадры при смене сцены (для стабильности).
+    // - -r 30: принудительно 30 FPS для плавности.
+    // - -b:v 400k: целевой битрейт 400 kbps (примерно 3 МБ/мин).
+    // - -maxrate 600k: максимальный битрейт.
+    // - -bufsize 800k: размер буфера.
+    // - -pix_fmt yuv420p: для лучшей совместимости.
+    // - -movflags +faststart: для быстрой загрузки в браузере.
     const ffmpegArgs = [
       '-i', inputPath,
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-profile:v', 'main',
-      '-crf', '23',
+      '-crf', '23', // Оптимальный баланс качества и размера для 720p
       '-g', '30',
       '-keyint_min', '30',
       '-sc_threshold', '0',
       '-r', '30',
-      '-b:v', '400k',
-      '-maxrate', '600k',
-      '-bufsize', '800k',
-      '-pix_fmt', 'yuv420p',
-      '-movflags', '+faststart',
+      '-b:v', '400k', // Целевой битрейт 400 kbps (~3 МБ/мин)
+      '-maxrate', '600k', // Максимальный битрейт
+      '-bufsize', '800k', // Размер буфера
+      '-pix_fmt', 'yuv420p', // Для лучшей совместимости
+      '-movflags', '+faststart', // Для быстрой загрузки в браузере
       '-c:a', 'libopus',
       '-b:a', '128k',
       '-ar', '48000',
       '-ac', '1',
-      '-filter:v', 'fps=fps=30:round=near,scale=640:640:force_original_aspect_ratio=increase,crop=640:640',
+      '-filter:v', 'fps=fps=30:round=near,scale=640:640:force_original_aspect_ratio=increase,crop=640:640', // Жесткая стабилизация FPS и квадрат для кружка
       '-y',
       outputPath
     ];
@@ -360,211 +270,8 @@ cleanupOldFiles();
 const PORT = process.env.PORT || 3000;
 const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
 const MAX_CONNS_PER_IP = 8;
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ── HTTP-СЕРВЕР (совмещает Health-check + Stealth HTTP Fallback) ──────────────
-// Render требует один HTTP-порт. Мы поднимаем HTTP на HEALTH_PORT,
-// а WebSocket — на PORT. HTTP-сервер обрабатывает:
-//   GET  /health            — health-check для Render
-//   GET  /stats             — статистика (с токеном)
-//   POST /api/v1/metrics/init      — DH key exchange
-//   POST /api/v1/metrics/collect   — HTTP fallback: клиент шлёт пакет, получает ответы
-// ═══════════════════════════════════════════════════════════════════════════
-
-const STATS_TOKEN = process.env.STATS_TOKEN || '';
-
-// Буфер HTTP-fallback сообщений: peerId → [{obj, ts}]
-// Сервер складывает сюда исходящие сообщения для клиентов без WS
-const httpFallbackQueues = new Map();
-
-function httpFallbackEnqueue(peerId, obj) {
-  if (!httpFallbackQueues.has(peerId)) httpFallbackQueues.set(peerId, []);
-  const q = httpFallbackQueues.get(peerId);
-  q.push({ obj, ts: Date.now() });
-  // Не копим больше 200 сообщений
-  if (q.length > 200) q.splice(0, q.length - 200);
-}
-
-// Очистка старых HTTP-fallback буферов (старше 5 минут)
-setInterval(() => {
-  const cutoff = Date.now() - 5 * 60 * 1000;
-  for (const [pid, q] of httpFallbackQueues) {
-    const filtered = q.filter(x => x.ts > cutoff);
-    if (filtered.length === 0) httpFallbackQueues.delete(pid);
-    else httpFallbackQueues.set(pid, filtered);
-  }
-}, 60 * 1000);
-
-// Читаем тело HTTP-запроса как Buffer
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', c => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
-}
-
-const healthServer = http.createServer(async (req, res) => {
-  // ── CORS для браузера ──
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-Seq, X-Client-Public-Key');
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    return res.end();
-  }
-
-  // ── Health-check ──
-  if (req.url === '/health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    // Имитируем обычный веб-сервер
-    res.end('OK');
-    return;
-  }
-
-  // ── Stats ──
-  if (req.url === '/stats' && STATS_TOKEN) {
-    const auth = req.headers['authorization'] || '';
-    if (auth !== `Bearer ${STATS_TOKEN}`) {
-      res.writeHead(403);
-      return res.end('Forbidden');
-    }
-    const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM events').get().cnt;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ activeConnections: peers.size, queuedEvents: eventCount }));
-    return;
-  }
-
-  // ── Stealth Init: Diffie-Hellman key exchange ──
-  // POST /api/v1/metrics/init
-  // Headers: X-Client-Public-Key: <base64 client public key>
-  // Response: { "sid": "...", "publicKey": "<base64 server public key>" }
-  if (req.url === '/api/v1/metrics/init' && req.method === 'POST') {
-    try {
-      const clientPublicKeyB64 = req.headers['x-client-public-key'];
-      if (!clientPublicKeyB64) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Missing X-Client-Public-Key header' }));
-        return;
-      }
-
-      const clientPublicKey = Buffer.from(clientPublicKeyB64, 'base64');
-      const dh = crypto.createDiffieHellman(DH_PRIME, DH_GENERATOR);
-      const serverPublicKey = dh.generateKeys();
-      const sharedSecret = dh.computeSecret(clientPublicKey);
-
-      const sid = crypto.randomBytes(16).toString('hex'); // Session ID
-      const sessionKey = crypto.createHash('sha256').update(sharedSecret).digest().slice(0, 32); // 32-byte key
-
-      stealthSessions.set(sid, { key: sessionKey, txCounter: 0, rxCounter: 0, dh: dh, createdAt: Date.now() });
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        sid: sid,
-        publicKey: serverPublicKey.toString('base64')
-      }));
-      console.log(`[Stealth-DH] Session ${sid} initialized.`);
-    } catch (e) {
-      console.error("[Stealth-DH] Init error:", e);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Server error' }));
-    }
-    return;
-  }
-
-  // ── Stealth Poll: HTTP fallback для заблокированных WS ──
-  // POST /api/v1/metrics/collect
-  // Headers: X-Session-Id: <sid>, X-Seq: <counter>
-  // Body: бинарный Stealth-фрейм с JSON-сообщением
-  // Response: бинарный Stealth-фрейм (массив ответных сообщений)
-  if (req.url === '/api/v1/metrics/collect' && req.method === 'POST') {
-    const sid = req.headers['x-session-id'];
-    const seq = parseInt(req.headers['x-seq'] || '0', 10);
-    const sess = stealthSessions.get(sid);
-
-    if (!sess) {
-      // Имитируем 404 обычного сайта
-      res.writeHead(404, { 'Content-Type': 'text/html' });
-      return res.end('<html><body>Not found</body></html>');
-    }
-
-    try {
-      const body = await readBody(req);
-      const decoded = stealthDecode(body, sess.key, seq);
-      if (!decoded) {
-        res.writeHead(400);
-        return res.end();
-      }
-
-      // Обновляем счётчик приёма
-      sess.rxCounter = seq + body.length; // This counter logic needs review, should be based on payload length not frame length
-
-      // Создаём виртуальный WS-объект для HTTP-клиентов
-      // Он накапливает ответы в буфер вместо отправки по WS
-      const responseBuffer = [];
-      const virtualWs = {
-        readyState: WebSocket.OPEN,
-        _isHttpFallback: true,
-        _peerId: null,
-        _responseBuffer: responseBuffer,
-        _stealthKey: sess.key, // Provide stealth key for virtual WS
-        _stealthTxCounter: sess.txCounter, // Provide txCounter
-        send(jsonStr) {
-          try {
-            const obj = JSON.parse(jsonStr);
-            responseBuffer.push(obj);
-          } catch(e) {}
-        }
-      };
-
-      // Если у нас есть peerId из сессии — добавляем накопленные сообщения
-      if (sess.peerId) {
-        const q = httpFallbackQueues.get(sess.peerId) || [];
-        for (const item of q) responseBuffer.push(item.obj);
-        httpFallbackQueues.delete(sess.peerId);
-      }
-
-      // Обрабатываем входящее сообщение
-      await handleMessage(virtualWs, decoded, sid);
-
-      // Если зарегистрировался — запоминаем peerId в сессии
-      if (virtualWs._peerId) sess.peerId = virtualWs._peerId;
-
-      // Кодируем все ответы в один бинарный фрейм
-      const responseJson = JSON.stringify({ batch: responseBuffer });
-      const encoded = stealthEncode({ batch: responseBuffer }, sess.key, sess.txCounter);
-      sess.txCounter += responseJson.length;
-
-      res.writeHead(200, {
-        'Content-Type': 'application/octet-stream',
-        'Content-Length': encoded.length,
-        // Имитируем заголовки обычного бинарного API
-        'X-Content-Type-Options': 'nosniff',
-        'Cache-Control': 'no-store'
-      });
-      res.end(encoded);
-    } catch(e) {
-      console.error('[Stealth-HTTP] Poll error:', e.message);
-      res.writeHead(500);
-      res.end();
-    }
-    return;
-  }
-
-  // Всё остальное — имитируем обычный веб-сервер (404)
-  res.writeHead(404, { 'Content-Type': 'text/html' });
-  res.end('<html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>');
-});
-
-healthServer.listen(HEALTH_PORT, () => {
-  console.log(`[Health+Stealth] listening on port ${HEALTH_PORT}`);
-});
-
-// ─── WebSocket Server ─────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({
-  noServer: true, // Attach to healthServer later
+  port: PORT,
   maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
@@ -581,15 +288,17 @@ const wss = new WebSocket.Server({
 });
 
 const peers = new Map();
+// ФИКС: Подписки на стриминг файлов. fileId -> Set(ws)
+// Когда прилетает новый чанк, мы пушим его всем подписчикам.
 const activeFetchers = new Map();
 const heartbeats = new Map();
 const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
 
-// Rate limiting
+// Rate limiting: не более 30 сообщений в секунду с одного подключения
 const rateLimits = new Map();
 function checkRateLimit(ws) {
   const now = Date.now();
-  const window = 1000;
+  const window = 1000; // 1 секунда
   let entry = rateLimits.get(ws);
   if (!entry) {
     entry = { count: 1, start: now };
@@ -615,36 +324,8 @@ setInterval(() => {
 
 const priorityQueues = new Map();
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── SEND: отправка с Stealth-кодированием ────────────────────────────────────
-// Если у WS-клиента есть сессионный ключ — отправляем бинарный фрейм.
-// Иначе — обычный JSON (обратная совместимость).
-// ═══════════════════════════════════════════════════════════════════════════
 function send(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  // HTTP fallback — просто добавляем в буфер
-  if (ws._isHttpFallback) {
-    ws._responseBuffer.push(obj);
-    return;
-  }
-
-  // Stealth-режим: бинарный фрейм
-  if (ws._stealthKey) {
-    try {
-      const frame = stealthEncode(obj, ws._stealthKey, ws._stealthTxCounter);
-      ws._stealthTxCounter += JSON.stringify(obj).length;
-      ws.send(frame);
-    } catch(e) {
-      console.warn("Stealth encode error, fallback to JSON:", e);
-      // Fallback на JSON если что-то пошло не так
-      ws.send(JSON.stringify(obj));
-    }
-    return;
-  }
-
-  // Обычный JSON (клиент без Stealth)
-  ws.send(JSON.stringify(obj));
+  if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
 function flushPriorityQueue(userId) {
@@ -653,22 +334,20 @@ function flushPriorityQueue(userId) {
   const queue = priorityQueues.get(userId) || [];
   while(queue.length > 0) {
     const msg = queue.shift();
-    try { send(ws, msg); } catch(e) { break; }
+    try { ws.send(JSON.stringify(msg)); } catch(e) { break; }
   }
   if(queue.length === 0) priorityQueues.delete(userId);
   else priorityQueues.set(userId, queue);
 }
 
 function broadcastPresence(peerId, isOnline) {
-  const msg = { type: 'presence', peerId, online: isOnline };
-  for(const [, ws] of peers) send(ws, msg);
+  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
+  for(const [, ws] of peers) if(ws.readyState === WebSocket.OPEN) ws.send(msg);
 }
-
 function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
   heartbeats.set(peerId, setTimeout(() => { peers.get(peerId)?.close(); }, HEARTBEAT_TIMEOUT));
 }
-
 function enqueueEvent(recipientId, type, payload) {
   return stmtInsertEvent.run(recipientId, type, JSON.stringify(payload), Date.now()).lastInsertRowid;
 }
@@ -695,407 +374,614 @@ function removeMember(groupId, peerId) {
   stmtUpdateGroupMbrs.run(JSON.stringify(JSON.parse(g.members).filter(id => id !== peerId)), groupId);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── ОБРАБОТЧИК СООБЩЕНИЙ (общий для WS и HTTP fallback) ──────────────────────
-// ═══════════════════════════════════════════════════════════════════════════
-async function handleMessage(ws, data, sessionId) {
-  // Для WS-клиентов rate-limit проверяется в onmessage
-  // Для HTTP-fallback — проверяем отдельно (лимит мягче: 60/сек)
+// ─── Соединения ──────────────────────────────────────────────────────────────
+wss.on('connection', (ws) => {
+  ws._socket.setTimeout(0);
+  ws._socket.setNoDelay(true);
+  ws._socket.setKeepAlive(true, 60000);
 
-  // Получаем myId из контекста ws
-  let myId = ws._myId || null;
+  let myId = null;
 
-  if(myId) resetHeartbeat(myId);
-
-  // ── Stealth-handshake: клиент сообщает свой sessionId ──
-  // { type: 'stealth-hello', sid: '...' }
-  // После этого все исходящие сообщения этому WS шифруются
-  if(data.type === 'stealth-hello') {
-    const sid = data.sid;
-    const sess = stealthSessions.get(sid);
-    if(sess) {
-      ws._stealthKey = sess.key;
-      ws._stealthTxCounter = 0;
-      ws._stealthRxCounter = 0;
-      ws._stealthSid = sid;
-      console.log(`[Stealth] WS client activated stealth mode, sid=${sid}`);
-    }
-    send(ws, { type: 'stealth-ack', ok: true });
-    return;
-  }
-
-  // ── Регистрация ───────────────────────────
-  if (data.type === "register") {
-    const peerId = data.peerId;
-    if (!peerId) return;
-
-    // Если это HTTP-fallback, сохраняем peerId в сессии
-    if (ws._isHttpFallback && sessionId) {
-      const sess = stealthSessions.get(sessionId);
-      if (sess) sess.peerId = peerId;
-    }
-
-    // Закрываем старое соединение, если есть
-    const existingWs = peers.get(peerId);
-    if (existingWs && existingWs !== ws) {
-      console.log(`Closing old connection for ${peerId}`);
-      existingWs.close(1000, 'New connection established');
-    }
-
-    ws._myId = peerId;
-    peers.set(peerId, ws);
-    resetHeartbeat(peerId);
-    broadcastPresence(peerId, true);
-    console.log(`Peer ${peerId} registered.`);
-
-    // Отправляем подтверждение регистрации
-    send(ws, { type: "registered", peerId: peerId });
-
-    // Отправляем все накопленные события
-    const events = stmtGetEvents.all(peerId);
-    for (const event of events) {
-      send(ws, JSON.parse(event.payload));
-      stmtDeleteEvent.run(event.id);
-    }
-    flushPriorityQueue(peerId);
-
-    // Отправляем информацию о файлах, ожидающих загрузки
-    const pendingFiles = stmtGetPendingFiles.all(peerId);
-    for (const fileHeader of pendingFiles) {
-      send(ws, { type: 'file-available', ...fileHeader });
-    }
-
-    return;
-  }
-
-  // ── Ping/Pong ─────────────────────────────
-  if (data.type === "ping") {
-    send(ws, { type: "pong" });
-    return;
-  }
-
-  // ── Отправка сообщений ────────────────────
-  if (data.type === "send-msg") {
-    const targetPeerId = data.target;
-    const targetWs = peers.get(targetPeerId);
-
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-      send(targetWs, { type: "incoming-msg", from: ws._myId, msgId: data.msgId, payload: data.payload });
-      // Отправляем ack отправителю
-      send(ws, { type: "msg-delivered", msgId: data.msgId, by: targetPeerId });
-    } else {
-      // Если получатель оффлайн, ставим в очередь
-      enqueueEvent(targetPeerId, 'incoming-msg', { from: ws._myId, msgId: data.msgId, payload: data.payload });
-      // Если это HTTP-fallback, то также добавляем в очередь для него
-      if (targetWs && targetWs._isHttpFallback) {
-        httpFallbackEnqueue(targetPeerId, { type: "incoming-msg", from: ws._myId, msgId: data.msgId, payload: data.payload });
-      }
-    }
-    return;
-  }
-
-  // ── Подтверждение получения сообщения ─────
-  if (data.type === "ack-msg") {
-    const { msgId } = data;
-    const acked = stmtAckMsg.get(ws._myId, msgId);
-    if (acked) {
-      stmtDeleteById.run(acked.id);
-      // Отправляем ack отправителю, что его сообщение прочитано
-      const senderWs = peers.get(acked.sender);
-      if (senderWs && senderWs.readyState === WebSocket.OPEN) {
-        send(senderWs, { type: "msg-read", msgId: msgId, by: ws._myId });
-      }
-    }
-    return;
-  }
-
-  // ── Запрос присутствия ────────────────────
-  if (data.type === "query-presence") {
-    const targetPeerId = data.target;
-    const isOnline = peers.has(targetPeerId) && peers.get(targetPeerId).readyState === WebSocket.OPEN;
-    send(ws, { type: "presence-reply", target: targetPeerId, online: isOnline });
-    return;
-  }
-
-  // ── Управление файлами ────────────────────
-  if (data.type === 'store-file-header') {
-    const { fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts } = data;
-    stmtInsertHeader.run(fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption || '', thumb || '', ts, Date.now());
-    // Уведомляем получателя о доступности файла
-    const targetWs = peers.get(recipientId);
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-      send(targetWs, { type: 'file-available', fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
-    } else {
-      enqueueEvent(recipientId, 'file-available', { fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
-      if (targetWs && targetWs._isHttpFallback) {
-        httpFallbackEnqueue(recipientId, { type: 'file-available', fileId, senderId, recipientId, name, size, mimeType, totalChunks, caption, thumb, ts });
-      }
-    }
-    send(ws, { type: 'store-file-header-ack', fileId });
-    return;
-  }
-
-  if (data.type === 'store-file-chunk') {
-    const { fileId, chunkIndex, data: chunkData } = data;
-    stmtInsertChunk.run(fileId, chunkIndex, chunkData, Date.now());
-    const header = stmtGetHeader.get(fileId);
-    if (header) {
-      const { cnt } = stmtCountChunks.get(fileId);
-      // Уведомляем отправителя о прогрессе
-      send(ws, { type: 'file-chunks-update', fileId, chunksReady: cnt, totalChunks: header.total_chunks });
-      // Если все чанки получены, уведомляем получателя
-      if (cnt === header.total_chunks) {
-        const targetWs = peers.get(header.recipient_id);
-        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-          send(targetWs, { type: 'file-upload-complete', fileId });
-        } else {
-          enqueueEvent(header.recipient_id, 'file-upload-complete', { fileId });
-          if (targetWs && targetWs._isHttpFallback) {
-            httpFallbackEnqueue(header.recipient_id, { type: 'file-upload-complete', fileId });
-          }
-        }
-      }
-    }
-    send(ws, { type: 'store-chunks-ack', fileId, chunkIndex });
-    return;
-  }
-
-  if (data.type === 'fetch-file') {
-    const { fileId } = data;
-    const header = stmtGetHeader.get(fileId);
-    if (!header) {
-      send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' });
-      return;
-    }
-    const { cnt: chunksReady } = stmtCountChunks.get(fileId);
-    if (chunksReady < header.total_chunks) {
-      send(ws, { type: 'file-fetch-partial', fileId, received: chunksReady, total: header.total_chunks });
-      return;
-    }
-
-    // Отправляем заголовок файла
-    send(ws, { type: 'file-data-header', fileId, name: header.name, mimeType: header.mime_type, size: header.size, totalChunks: header.total_chunks, caption: header.caption, thumb: header.thumb });
-
-    // Отправляем чанки
-    for (let i = 0; i < header.total_chunks; i++) {
-      const chunk = db.prepare('SELECT data FROM file_chunks WHERE file_id=? AND chunk_index=?').get(fileId, i);
-      if (chunk) {
-        send(ws, { type: 'file-data-chunk', fileId, chunkIndex: i, data: chunk.data });
-      } else {
-        console.error(`Missing chunk ${i} for file ${fileId}`);
-        send(ws, { type: 'file-fetch-error', fileId, msg: `Missing chunk ${i}` });
-        return;
-      }
-    }
-    return;
-  }
-
-  if (data.type === 'ack-file') {
-    const { fileId } = data;
-    // Удаляем файл из очереди получателя
-    stmtDeleteFileAvail.run(ws._myId, fileId);
-    // Уведомляем отправителя, что файл доставлен
-    const header = stmtGetHeader.get(fileId);
-    if (header) {
-      const senderWs = peers.get(header.sender_id);
-      if (senderWs && senderWs.readyState === WebSocket.OPEN) {
-        send(senderWs, { type: 'file-delivered', fileId, recipientId: ws._myId });
-      }
-    }
-    return;
-  }
-
-  // ── Группы ────────────────────────────────
-  if (data.type === 'create-group') {
-    const { name, avatar, description } = data;
-    const groupId = crypto.randomBytes(8).toString('hex');
-    const inviteCode = crypto.randomBytes(4).toString('hex');
-    stmtCreateGroup.run(groupId, name, ws._myId, inviteCode, avatar || '👥', description || '', JSON.stringify([ws._myId]), Date.now());
-    send(ws, { type: 'group-created', groupId, name, inviteCode });
-    return;
-  }
-
-  if (data.type === 'join-group') {
-    const { inviteCode } = data;
-    const group = getGroupInvite(inviteCode);
-    if (group) {
-      if (addMember(group.id, ws._myId)) {
-        send(ws, { type: 'group-joined', groupId: group.id, name: group.name });
-        // Уведомить всех членов группы о новом участнике
-        const members = JSON.parse(group.members);
-        for (const memberId of members) {
-          const memberWs = peers.get(memberId);
-          if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-            send(memberWs, { type: 'group-member-added', groupId: group.id, peerId: ws._myId });
-          }
-        }
-      } else {
-        send(ws, { type: 'group-join-failed', reason: 'Already a member or group full' });
-      }
-    } else {
-      send(ws, { type: 'group-join-failed', reason: 'Invalid invite code' });
-    }
-    return;
-  }
-
-  if (data.type === 'get-group-info') {
-    const { groupId } = data;
-    const group = getGroup(groupId);
-    if (group) {
-      send(ws, { type: 'group-info', ...group, members: JSON.parse(group.members) });
-    } else {
-      send(ws, { type: 'group-info-failed', reason: 'Group not found' });
-    }
-    return;
-  }
-
-  if (data.type === 'send-group-msg') {
-    const { groupId, msgId, payload } = data;
-    const group = getGroup(groupId);
-    if (group) {
-      const members = JSON.parse(group.members);
-      for (const memberId of members) {
-        if (memberId === ws._myId) continue; // Не отправляем самому себе
-        const memberWs = peers.get(memberId);
-        if (memberWs && memberWs.readyState === WebSocket.OPEN) {
-          send(memberWs, { type: 'incoming-group-msg', groupId, from: ws._myId, msgId, payload });
-        } else {
-          enqueueEvent(memberId, 'incoming-group-msg', { groupId, from: ws._myId, msgId, payload });
-          if (memberWs && memberWs._isHttpFallback) {
-            httpFallbackEnqueue(memberId, { type: 'incoming-group-msg', groupId, from: ws._myId, msgId, payload });
-          }
-        }
-      }
-      send(ws, { type: 'group-msg-delivered', groupId, msgId });
-    } else {
-      send(ws, { type: 'group-msg-failed', reason: 'Group not found' });
-    }
-    return;
-  }
-
-  // ── Прочие сообщения (реакции, редактирование, удаление и т.д.) ──
-  // Эти сообщения также должны быть зашифрованы и перенаправлены
-  if (data.target) {
-    const targetPeerId = data.target;
-    const targetWs = peers.get(targetPeerId);
-    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-      send(targetWs, { ...data, from: ws._myId });
-    } else {
-      enqueueEvent(targetPeerId, data.type, { ...data, from: ws._myId });
-      if (targetWs && targetWs._isHttpFallback) {
-        httpFallbackEnqueue(targetPeerId, { ...data, from: ws._myId });
-      }
-    }
-    return;
-  }
-
-  console.warn('Unhandled message type:', data.type, 'from', ws._myId);
-}
-
-wss.on("connection", (ws, req) => {
-  console.log("Client connected");
-  ws._myId = null; // Will be set on 'register'
-  ws._stealthKey = null; // Will be set on 'stealth-hello'
-  ws._stealthTxCounter = 0;
-  ws._stealthRxCounter = 0;
-  ws._stealthSid = null;
-
-  ws.on("message", async (message) => {
+  ws.on('message', async (raw) => {
     if (!checkRateLimit(ws)) {
-      console.warn('Rate limit exceeded for client');
-      ws.close(1008, 'Rate limit exceeded');
+      ws.close(4001, 'Rate limit exceeded');
       return;
     }
 
-    let parsedMessage;
-    let currentStealthSession = null;
+    let data;
+    try { data = JSON.parse(raw); } catch { return; }
 
-    if (ws._stealthSid) {
-      currentStealthSession = stealthSessions.get(ws._stealthSid);
-      if (currentStealthSession) {
-        ws._stealthKey = currentStealthSession.key;
-        ws._stealthTxCounter = currentStealthSession.txCounter;
-        ws._stealthRxCounter = currentStealthSession.rxCounter;
-      }
-    }
+    if(myId) resetHeartbeat(myId);
 
-    if (message instanceof Buffer) {
-      // Пробуем декодировать как Stealth-фрейм
-      if (ws._stealthKey) {
-        parsedMessage = stealthDecode(message, ws._stealthKey, ws._stealthRxCounter);
-        if (parsedMessage) {
-          ws._stealthRxCounter += message.length; // Update counter based on raw frame length
-          if (currentStealthSession) currentStealthSession.rxCounter = ws._stealthRxCounter;
-        } else {
-          // Если не Stealth-фрейм, пробуем как обычный JSON в бинарном буфере
-          try { parsedMessage = JSON.parse(message.toString('utf8')); } catch (e) { console.warn("Failed to parse binary message as JSON:", e); return; }
+    // ── Регистрация ──────────────────────────────────────────────────────────
+    if(data.type === 'register') {
+      const newId = (data.peerId || '').toLowerCase().trim();
+      if(!newId) return;
+      const old = peers.get(newId);
+      if(old && old !== ws && old.readyState === WebSocket.OPEN) old.close();
+      myId = newId;
+      peers.set(myId, ws);
+      send(ws, { type: 'registered' });
+      broadcastPresence(myId, true);
+      resetHeartbeat(myId);
+
+      flushPriorityQueue(myId);
+
+      const rows = stmtGetEvents.all(myId);
+      const events = rows.map(r => ({
+        id: r.id,
+        type: r.type,
+        payload: JSON.parse(r.payload)
+      }));
+      for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
+
+      // ОПТИМИЗАЦИЯ 3: при reconnect показываем файлы которые уже начали загружаться
+      // (даже если ещё не все чанки получены — клиент увидит thumb сразу)
+      const pendingFiles = stmtGetPendingFiles.all(myId);
+      for(const h of pendingFiles) {
+        const cnt = stmtCountChunks.get(h.file_id);
+        // Показываем file-available если есть хотя бы 1 чанк (стриминг)
+        // или если файл полностью загружен
+        if(cnt && cnt.cnt >= 1) {
+          send(ws, {
+            type: 'file-available',
+            fileId: h.file_id,
+            senderId: h.sender_id,
+            name: h.name,
+            size: h.size,
+            mimeType: h.mime_type,
+            totalChunks: h.total_chunks,
+            caption: h.caption,
+            thumb: h.thumb || '',
+            ts: h.ts,
+            // ОПТИМИЗАЦИЯ 4: сообщаем клиенту сколько чанков уже есть
+            chunksReady: cnt.cnt
+          });
         }
-      } else {
-        // Если Stealth-сессия ещё не установлена, пробуем как обычный JSON
-        try { parsedMessage = JSON.parse(message.toString('utf8')); } catch (e) { console.warn("Failed to parse binary message as JSON (no stealth session):", e); return; }
       }
-    } else {
-      // Текстовое сообщение — обычный JSON
-      try { parsedMessage = JSON.parse(message); } catch (e) { console.warn("Failed to parse text message as JSON:", e); return; }
+      return;
     }
 
-    if (!parsedMessage) return;
+    if(data.type === 'ping') { return; }
 
-    await handleMessage(ws, parsedMessage);
+    if(data.type === 'register-push') {
+      if(!myId || !data.playerId) return;
+      pushSubs[myId] = data.playerId;
+      try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
+      return;
+    }
 
-    // Update txCounter in session after sending responses
-    if (ws._stealthSid && currentStealthSession) {
-      currentStealthSession.txCounter = ws._stealthTxCounter;
+    // ── ОБРАБОТКА ГОЛОСОВЫХ СООБЩЕНИЙ ─────────────────────────────────────────
+    if(data.type === 'send-msg' && data.payload && data.payload.startsWith('data:audio')) {
+      try {
+        const processed = await processVoiceMessage(data.payload);
+        data.payload = processed.data;
+        console.log(`[Voice] Оптимизировано голосовое сообщение (сжато на ${processed.compression}%)`);
+      } catch (error) {
+        console.error('Ошибка при обработке голосового:', error);
+      }
+    }
+
+    // ── file‑available‑ack ────────────────────────────────────────────────
+    if(data.type === 'file-available-ack') {
+      if(!myId) return;
+      const header = stmtGetHeader.get(data.fileId);
+      if(header && header.recipient_id === myId) {
+        // Уведомляем отправителя о доставке (✔✔) ТОЛЬКО когда файл полностью загружен на сервер
+        // и получатель подтвердил получение заголовка
+        const cnt = stmtCountChunks.get(data.fileId);
+        if(cnt && cnt.cnt >= header.total_chunks) {
+          const deliveryPayload = { fileId: data.fileId, by: myId };
+          const eventId = enqueueEvent(header.sender_id, 'file-delivered', deliveryPayload);
+          const senderWs = peers.get(header.sender_id);
+          if(senderWs) send(senderWs, { type: 'file-delivered', ...deliveryPayload, eventId });
+        }
+      }
+      return;
+    }
+
+    // ── ФАЙЛОВЫЙ ПРОТОКОЛ ─────────────────────────────────────────────────
+    if(data.type === 'store-file-header') {
+      if(!myId) return;
+      const recipient = (data.recipientId || '').toLowerCase();
+      if(!recipient) return;
+      // ОПТИМИЗАЦИЯ 1: сохраняем thumb из заголовка
+      stmtInsertHeader.run(
+        data.fileId, myId, recipient, data.name, data.size,
+        data.mimeType, data.totalChunks, data.caption || '',
+        data.thumb || '',
+        data.ts || Date.now(), Date.now()
+      );
+      send(ws, { type: 'store-file-header-ack', fileId: data.fileId });
+      return;
+    }
+
+    if(data.type === 'store-chunks') {
+      if(!myId) return;
+      const chunks = data.chunks;
+      if(!Array.isArray(chunks)) return;
+
+      const header = stmtGetHeader.get(data.fileId);
+      if(!header) return;
+
+      // ОПТИМИЗАЦИЯ 4: Сохраняем чанки как есть (сервер НЕ склеивает)
+      for(const chunk of chunks) {
+        stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
+      }
+
+      const cnt = stmtCountChunks.get(data.fileId);
+      const receivedCount = cnt ? cnt.cnt : 0;
+
+      // ОПТИМИЗАЦИЯ 3: Отправляем file-available получателю СРАЗУ после первого чанка
+      // Не ждём пока все чанки загрузятся — получатель начнёт скачивать параллельно
+      if(receivedCount === chunks.length && receivedCount >= 1) {
+        // Это первый батч чанков — сигнализируем получателю немедленно
+        const payload = {
+          fileId: data.fileId,
+          senderId: myId,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          // ОПТИМИЗАЦИЯ 1: передаём thumb в уведомлении
+          thumb: header.thumb || '',
+          ts: header.ts,
+          // ОПТИМИЗАЦИЯ 4: сообщаем сколько чанков уже готово
+          chunksReady: receivedCount
+        };
+
+        const recipientWs = peers.get(header.recipient_id);
+
+        // Проверяем: уже ли отправляли file-available этому получателю для этого файла?
+        const alreadyNotified = db.prepare(
+          `SELECT id FROM events WHERE recipient_id=? AND type='file-available' AND json_extract(payload,'$.fileId')=? LIMIT 1`
+        ).get(header.recipient_id, data.fileId);
+
+        if(!alreadyNotified) {
+          // Первый раз — сохраняем в очередь и отправляем
+          const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            flushPriorityQueue(header.recipient_id);
+            send(recipientWs, { type: 'file-available', ...payload, eventId });
+          } else {
+            const queue = priorityQueues.get(header.recipient_id) || [];
+            queue.push({ type: 'file-available', ...payload, eventId });
+            priorityQueues.set(header.recipient_id, queue);
+            sendPush(header.recipient_id, `📎 ${header.name}`);
+          }
+        } else {
+          // Уже уведомляли — просто обновляем chunksReady у получателя если он онлайн
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
+          }
+        }
+      } else if(receivedCount > chunks.length) {
+        // Последующие батчи — обновляем получателя о прогрессе
+        const recipientWs = peers.get(header.recipient_id);
+        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
+        }
+      }
+
+      // Проверяем завершение загрузки
+      if(receivedCount >= header.total_chunks) {
+        // ── Пост-обработка видео-кружков на сервере ──
+        if (header.name.includes('__vnote__')) {
+          (async () => {
+            let inputPath, outputPath;
+            try {
+              const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(data.fileId);
+              const buffer = Buffer.concat(chunks.map(c => Buffer.from(c.data, 'base64')));
+              inputPath = await saveTemporaryFile(buffer, '.webm');
+              outputPath = inputPath.replace('.webm', '-optimized.webm');
+              
+              await optimizeVideoWithFFmpeg(inputPath, outputPath);
+              
+              const optimizedData = fs.readFileSync(outputPath);
+              const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024));
+              
+              // Обновляем хедер и чанки
+              db.transaction(() => {
+                stmtDeleteChunks.run(data.fileId);
+                db.prepare(`UPDATE file_headers SET size=?, total_chunks=? WHERE file_id=?`).run(optimizedData.length, newTotalChunks, data.fileId);
+                for (let i = 0; i < newTotalChunks; i++) {
+                  const start = i * (256 * 1024);
+                  const chunk = optimizedData.slice(start, start + (256 * 1024));
+                  stmtInsertChunk.run(data.fileId, i, chunk.toString('base64'), Date.now());
+                }
+              })();
+              
+              const updatedHeader = stmtGetHeader.get(data.fileId);
+              const payload = {
+                fileId: data.fileId,
+                senderId: header.sender_id,
+                name: updatedHeader.name,
+                size: updatedHeader.size,
+                mimeType: updatedHeader.mime_type,
+                totalChunks: updatedHeader.total_chunks,
+                caption: updatedHeader.caption,
+                thumb: updatedHeader.thumb || '',
+                ts: updatedHeader.ts,
+                chunksReady: updatedHeader.total_chunks
+              };
+              
+              // Обновляем событие в очереди (удаляем старое, добавляем новое с актуальными данными)
+              stmtDeleteFileAvail.run(updatedHeader.recipient_id, data.fileId);
+              const eventId = enqueueEvent(updatedHeader.recipient_id, 'file-available', payload);
+              const recipientWs = peers.get(updatedHeader.recipient_id);
+              if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+                send(recipientWs, { type: 'file-available', ...payload, eventId });
+              }
+              send(ws, { type: 'file-upload-complete', fileId: data.fileId });
+            } catch (e) {
+              console.error('[VN-Optimize] Error:', e);
+              // Если ошибка — отправляем как есть
+              const updHeader = stmtGetHeader.get(data.fileId);
+              const payload = { fileId: data.fileId, senderId: header.sender_id, name: header.name, size: header.size, mimeType: header.mime_type, totalChunks: header.total_chunks, caption: header.caption, thumb: header.thumb||'', ts: header.ts, chunksReady: header.total_chunks };
+              stmtDeleteFileAvail.run(header.recipient_id, data.fileId);
+              const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
+              const recipientWs = peers.get(header.recipient_id);
+              if(recipientWs && recipientWs.readyState === WebSocket.OPEN) send(recipientWs, { type: 'file-available', ...payload, eventId });
+              send(ws, { type: 'file-upload-complete', fileId: data.fileId });
+            } finally {
+              cleanupTemporaryFile(inputPath);
+              cleanupTemporaryFile(outputPath);
+            }
+          })();
+          return;
+        }
+
+        // ФИКС: PUSH-стриминг чанков.
+        // Если кто-то сейчас «слушает» этот файл (fetch-file), проталкиваем ему чанки мгновенно.
+        const fetchers = activeFetchers.get(data.fileId);
+        if (fetchers) {
+          data.chunks.forEach(c => {
+            const chunkMsg = {
+              type: 'file-data-chunk',
+              fileId: data.fileId,
+              index: c.index,
+              total: header.total_chunks,
+              data: c.data
+            };
+            fetchers.forEach(fws => {
+              if (fws.readyState === WebSocket.OPEN) send(fws, chunkMsg);
+            });
+          });
+        }
+
+        // Обычный файл — отправляем file-upload-complete отправителю
+        // file-available уже был отправлен получателю после первого чанка
+        // Обновляем chunksReady до финального значения
+        const recipientWs = peers.get(header.recipient_id);
+        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+          send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
+        }
+
+        // ФИКС: Отправляем уведомление о завершении загрузки
+        send(ws, { type: 'file-upload-complete', fileId: data.fileId });
+        
+        // ИСПРАВЛЕНИЕ БАГА: НЕ отправляем file-delivered автоматически при завершении загрузки на сервер.
+        // file-delivered должен приходить ТОЛЬКО когда получатель реально скачал файл
+        // (через file-available-ack или через зашифрованный сигнал от получателя).
+        // Иначе у отправителя сразу ставится ✔✔ даже если получатель офлайн.
+        
+        // Форсируем уведомление получателя о финальном количестве чанков (если он онлайн)
+        setTimeout(() => {
+          const recipientWs = peers.get(header.recipient_id);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: header.total_chunks, totalChunks: header.total_chunks });
+          }
+        }, 100);
+      } else {
+        send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
+      }
+      return;
+    }
+
+    if(data.type === 'fetch-file') {
+      if(!myId) return;
+      const fileId = data.fileId;
+      const fromIndex = data.fromIndex || 0;
+      const header = stmtGetHeader.get(fileId);
+      if(!header) { send(ws, { type: 'file-fetch-error', fileId, msg: 'File not found' }); return; }
+      if(header.recipient_id !== myId) { send(ws, { type: 'file-fetch-error', fileId, msg: 'Access denied' }); return; }
+
+      // ФИКС: Подписываем клиента на новые чанки этого файла (PUSH-стриминг)
+      // Теперь сервер будет сам «проталкивать» новые чанки по мере их поступления
+      if (!activeFetchers.has(fileId)) activeFetchers.set(fileId, new Set());
+      activeFetchers.get(fileId).add(ws);
+
+      const chunks = db.prepare(`SELECT * FROM file_chunks WHERE file_id=? ORDER BY chunk_index`).all(fileId);
+      
+      // Отправляем заголовок с информацией о текущем прогрессе на сервере
+      send(ws, {
+        type: 'file-data-header',
+        fileId: fileId,
+        senderId: header.sender_id,
+        name: header.name,
+        size: header.size,
+        mimeType: header.mime_type,
+        totalChunks: header.total_chunks,
+        caption: header.caption,
+        thumb: header.thumb || '',
+        ts: header.ts,
+        fromIndex: fromIndex,
+        chunksReady: chunks.length
+      });
+
+      // Отправляем те чанки, которые УЖЕ есть в базе
+      for(const chunk of chunks) {
+        if(chunk.chunk_index >= fromIndex) {
+          send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
+        }
+      }
+      return;
+    }
+
+    if(data.type === 'ack-file') {
+      if(!myId) return;
+      const header = stmtGetHeader.get(data.fileId);
+      if(header) {
+        if(header.recipient_id === myId) {
+          // Это ack от получателя — файл успешно скачан и сохранён
+          // ПРОВЕРКА: Удаляем только если файл реально полностью загружен на сервер!
+          const cnt = stmtCountChunks.get(data.fileId);
+          if(cnt && cnt.cnt >= header.total_chunks) {
+            stmtDeleteChunks.run(data.fileId);
+            stmtDeleteHeader.run(data.fileId);
+            stmtDeleteFileAvail.run(myId, data.fileId);
+            console.log(`[File] Deleted ${data.fileId} after recipient ack`);
+          } else {
+            console.log(`[File] Recipient sent ack for ${data.fileId}, but file is still uploading (${cnt?.cnt}/${header.total_chunks}). Keeping for now.`);
+          }
+        } else if(header.sender_id === myId) {
+          // Это ack от отправителя — НЕ удаляем, файл может быть нужен получателю
+          console.log(`[File] Received ack from sender for ${data.fileId}, keeping file`);
+        }
+      }
+      return;
+    }
+
+    if(data.type === 'send-msg') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      if(!target) return;
+      const msgId = data.msgId;
+      const payload = data.payload;
+      const eventId = enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
+      const targetWs = peers.get(target);
+      if(targetWs && targetWs.readyState === WebSocket.OPEN) {
+        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload, eventId });
+      } else {
+        const queue = priorityQueues.get(target) || [];
+        queue.push({ type: 'incoming-msg', from: myId, msgId, payload, eventId });
+        priorityQueues.set(target, queue);
+        sendPush(target, `💬 ${myId}`);
+      }
+      return;
+    }
+
+    // ── ack-msg: получатель реально открыл чат / увидел сообщение ───────────
+    if(data.type === 'ack-msg') {
+      if(!myId || !data.msgId) return;
+      const row = stmtAckMsg.get(myId, data.msgId);
+      if(!row) return;
+      stmtDeleteById.run(row.id);
+      if(!row.sender) return;
+      const deliveryPayload = { msgId: data.msgId, by: myId };
+      const deliveredEventId = enqueueEvent(row.sender, 'msg-delivered', deliveryPayload);
+      const senderWs = peers.get(row.sender);
+      if(senderWs && senderWs.readyState === WebSocket.OPEN) {
+        send(senderWs, { type: 'msg-delivered', ...deliveryPayload, eventId: deliveredEventId });
+      }
+      return;
+    }
+
+    if(data.type === 'ack-event') {
+      if(!myId) return;
+      stmtDeleteEvent.run(data.eventId);
+      return;
+    }
+
+    if(data.type === 'query-presence') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      send(ws, { type: 'presence-reply', target, online: peers.has(target) });
+      return;
+    }
+
+    // ── voice-listened: получатель прослушал голосовое ────────────────────
+    if(data.type === 'voice-listened') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      const eventId = enqueueEvent(target, 'voice-listened', { from: myId, voiceMsgId: data.voiceMsgId });
+      const tw = peers.get(target);
+      if(tw) send(tw, { type: 'voice-listened', from: myId, voiceMsgId: data.voiceMsgId, eventId });
+      return;
+    }
+
+    // ── vn-watched: получатель просмотрел видео-кружок ────────────────────
+    if(data.type === 'vn-watched') {
+      if(!myId) return;
+      const target = (data.target || '').toLowerCase();
+      if(!target || !data.vnMsgId) return;
+      const eventPayload = { from: myId, vnMsgId: data.vnMsgId };
+      const eventId = enqueueEvent(target, 'vn-watched', eventPayload);
+      const tw = peers.get(target);
+      if(tw) send(tw, { type: 'vn-watched', from: myId, vnMsgId: data.vnMsgId, eventId });
+      return;
+    }
+
+    // ── Группы ────────────────────────────────────────────────────────────
+    if(data.type === 'create-group') {
+      if(!myId) return;
+      if(getGroupInvite(data.inviteCode) || getGroup(data.groupId)) {
+        send(ws, { type: 'error', msg: 'Группа уже существует' }); return;
+      }
+      stmtCreateGroup.run(data.groupId, data.name, data.creator, data.inviteCode,
+        data.avatar||'👥', data.description||'', JSON.stringify([data.creator]), Date.now());
+      send(ws, { type: 'group-created', groupId: data.groupId });
+      return;
+    }
+    if(data.type === 'group-info') {
+      const g = getGroupInvite(data.inviteCode);
+      if(!g) { send(ws, { type: 'error', msg: 'Группа не найдена' }); return; }
+      send(ws, { type: 'group-info-reply', group: { groupId: g.id, name: g.name, avatar: g.avatar, description: g.description } });
+      return;
+    }
+    if(data.type === 'join-group') {
+      if(!myId) return;
+      const g = getGroupInvite(data.inviteCode);
+      if(!g) { send(ws, { type: 'error', msg: 'Группа не найдена' }); return; }
+      if(JSON.parse(g.members).length >= 20) { send(ws, { type: 'error', msg: 'Группа переполнена' }); return; }
+      if(!addMember(g.id, data.peerId)) { send(ws, { type: 'error', msg: 'Вы уже в группе' }); return; }
+      const updated = getGroup(g.id);
+      const members = JSON.parse(updated.members);
+      send(ws, { type: 'group-joined', groupId: g.id, name: g.name, avatar: g.avatar,
+        description: g.description, inviteCode: g.invite_code, members });
+      members.forEach(mid => {
+        if(mid === data.peerId) return;
+        const ev = { type: 'group-updated', groupId: g.id, members };
+        const tw = peers.get(mid); if(tw) send(tw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-update') {
+      if(!myId) return;
+      const g = getGroup(data.groupId);
+      if(!g || g.creator_id !== myId) return;
+      stmtUpdateGroup.run(data.changes.name||g.name, data.changes.avatar||g.avatar,
+        data.changes.description||g.description,
+        data.changes.members ? JSON.stringify(data.changes.members) : g.members, data.groupId);
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, changes: data.changes };
+        const tw = peers.get(mid); if(tw) send(tw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-remove-member') {
+      if(!myId) return;
+      const g = getGroup(data.groupId);
+      if(!g || g.creator_id !== myId || data.targetPeerId === myId) return;
+      removeMember(data.groupId, data.targetPeerId);
+      const updated = getGroup(data.groupId);
+      const tw = peers.get(data.targetPeerId);
+      const removedEv = { type: 'group-member-removed', groupId: data.groupId, targetPeerId: data.targetPeerId };
+      if(tw) send(tw, removedEv); else enqueueEvent(data.targetPeerId, 'group-member-removed', removedEv);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, members: JSON.parse(updated.members) };
+        const mw = peers.get(mid); if(mw) send(mw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-leave') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      removeMember(data.groupId, data.peerId);
+      const updated = getGroup(data.groupId);
+      JSON.parse(updated.members).forEach(mid => {
+        const ev = { type: 'group-updated', groupId: data.groupId, members: JSON.parse(updated.members) };
+        const mw = peers.get(mid); if(mw) send(mw, ev); else enqueueEvent(mid, 'group-updated', ev);
+      });
+      return;
+    }
+    if(data.type === 'group-members') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      send(ws, { type: 'group-members-reply', groupId: data.groupId, members: JSON.parse(g.members) });
+      return;
+    }
+    if(data.type === 'group-read') {
+      if(!myId) return;
+      const g = getGroup(data.groupId); if(!g) return;
+      JSON.parse(g.members).forEach(mid => {
+        if(mid === data.readerPeerId) return;
+        const ev = { type: 'group-msg-read', groupId: data.groupId, msgId: data.msgId };
+        const mw = peers.get(mid); if(mw) send(mw, ev); else enqueueEvent(mid, 'group-msg-read', ev);
+      });
+      return;
+    }
+
+    if(data.type === 'signal' && data.target) {
+      const tw = peers.get(data.target.toLowerCase());
+      if(tw) send(tw, { type: 'signal', from: myId, payload: data.payload });
     }
   });
 
-  ws.on("close", () => {
-    console.log(`Client ${ws._myId || 'unknown'} disconnected.`);
-    if (ws._myId) {
-      peers.delete(ws._myId);
-      broadcastPresence(ws._myId, false);
-      if (heartbeats.has(ws._myId)) clearTimeout(heartbeats.get(ws._myId));
+  ws.on('close', () => {
+    if(myId) {
+      clearTimeout(heartbeats.get(myId));
+      heartbeats.delete(myId);
+      if(peers.get(myId) === ws) { 
+        peers.delete(myId); 
+        broadcastPresence(myId, false); 
+      }
+      
+      // ФИКС: Очищаем подписки этого клиента на стриминг файлов
+      activeFetchers.forEach((subs, fileId) => {
+        if (subs.has(ws)) {
+          subs.delete(ws);
+          if (subs.size === 0) activeFetchers.delete(fileId);
+        }
+      });
     }
-    // Clean up stealth session if it was active for this WS
-    // Note: We don't delete the session immediately, as it might be used by HTTP fallback
-    // A separate cleanup mechanism for old sessions is handled by setInterval.
   });
-
-  ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
-  });
+  ws.on('error', (err) => console.error('WS error:', err.message));
 });
 
-// Attach WebSocket server to the HTTP server
-healthServer.on('upgrade', (request, socket, head) => {
-  const pathname = url.parse(request.url).pathname;
-  if (pathname === '/') {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
+// ─── Health‑check /stats endpoint ────────────────────────────────────────────
+const STATS_TOKEN = process.env.STATS_TOKEN || '';
+const healthServer = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+  } else if (req.url === '/stats' && STATS_TOKEN) {
+    const auth = req.headers['authorization'] || '';
+    if (auth !== `Bearer ${STATS_TOKEN}`) {
+      res.writeHead(403);
+      return res.end('Forbidden');
+    }
+    const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM events').get().cnt;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      activeConnections: peers.size,
+      queuedEvents: eventCount
+    }));
   } else {
-    socket.destroy();
+    res.writeHead(404);
+    res.end();
   }
 });
+healthServer.listen(HEALTH_PORT, () => {
+  console.log(`[Health] listening on port ${HEALTH_PORT}`);
+});
 
-// Dummy message store for demonstration
-const messages = [];
+// ─── Мониторинг (каждые 5 минут) ────────────────────────────────────────────
+setInterval(() => {
+  console.log(`[Stats] Active connections: ${peers.size}`);
+}, 5 * 60 * 1000);
 
-// Function to send a message to a specific peer
-function sendMessageToPeer(targetPeerId, message) {
-  const targetWs = peers.get(targetPeerId);
-  if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-    send(targetWs, message);
-  } else {
-    // If target is offline, enqueue for later delivery
-    enqueueEvent(targetPeerId, message.type, message);
-    // If target is using HTTP fallback, enqueue for next poll
-    const sess = Array.from(stealthSessions.values()).find(s => s.peerId === targetPeerId);
-    if (sess) {
-      httpFallbackEnqueue(targetPeerId, message);
-    }
+// ─── Graceful shutdown ─────────────────────────────────────────────────────────
+function gracefulShutdown() {
+  console.log('\n[Shutdown] closing all connections…');
+  for (const [, ws] of peers) {
+    try { ws.close(1001, 'Server restarting'); } catch(e) {}
   }
+  try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
+  try { db.close(); } catch(e) {}
+  console.log('[Shutdown] done');
+  process.exit(0);
 }
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
-// Export for testing or other modules if needed
-module.exports = { healthServer, wss, stealthEncode, stealthDecode, stealthSessions, sendMessageToPeer };
+// ─── Самопинг ────────────────────────────────────────────────────────────────
+const APP_URL = 'https://signal-server-aipd.onrender.com';
+setInterval(() => {
+  https.get(APP_URL, res => console.log(`[Self-Ping] ${res.statusCode}`))
+       .on('error', err => console.error(`[Self-Ping] Error: ${err.message}`));
+}, 4 * 60 * 1000);
+
+console.log(`[K-Chat server] ready on port ${PORT}`);
