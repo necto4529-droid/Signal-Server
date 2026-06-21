@@ -1120,7 +1120,11 @@ function _sendGzip(req, res, statusCode, headers, body) {
 }
 
 const healthServer = http.createServer((req, res) => {
-  if (req.url === '/health') {
+  if (req.url === '/ping') {
+    // Эндпоинт для замера задержки сети (работает в Median.co и браузерах)
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, ts: Date.now() }));
+  } else if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
   } else if (req.url === '/stats' && STATS_TOKEN) {
