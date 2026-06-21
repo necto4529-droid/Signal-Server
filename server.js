@@ -131,21 +131,39 @@ async function sendPush(userId, message) {
 }
 
 // ─── АУДИО ОБРАБОТКА (FFmpeg) ─────────────────────────────────────────────────
-async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
+// Адаптивные пресеты для голосовых сообщений:
+// - ultra: 8 kbps / 8 kHz  — EDGE/GPRS (голос весит ~1 КБ/с)
+// - low:   16 kbps / 16 kHz — 2G/3G (голос весит ~2 КБ/с)
+// - normal: 32 kbps / 24 kHz — 4G/WiFi (стандарт)
+async function optimizeAudioWithFFmpeg(inputPath, outputPath, preset = 'normal') {
   return new Promise((resolve, reject) => {
-      const ffmpegArgs = [
-        '-i', inputPath,
-        '-c:a', 'libopus',
-        '-b:a', '32k',
-        '-vbr', 'on',
-        '-compression_level', '10',
-        '-ar', '24000',
-        '-ac', '1',
-        '-application', 'audio',
-        '-filter_complex', 'afftdn=nr=5:nf=-20:rn=0.005:rf=0.005,adeclick,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11',
-        '-y',
-        outputPath
-      ];
+    let bitrate, sampleRate, filterComplex;
+    if (preset === 'ultra') {
+      // EDGE/GPRS: ультра-сжатие — 8 kbps, 8 kHz (телефонное качество)
+      bitrate = '8k'; sampleRate = '8000';
+      filterComplex = 'aresample=8000,acompressor=ratio=3:attack=5:release=50:threshold=-20:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11';
+    } else if (preset === 'low') {
+      // 2G/3G: низкое сжатие — 16 kbps, 16 kHz
+      bitrate = '16k'; sampleRate = '16000';
+      filterComplex = 'afftdn=nr=5:nf=-20,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11';
+    } else {
+      // 4G/WiFi: стандартное сжатие — 32 kbps, 24 kHz
+      bitrate = '32k'; sampleRate = '24000';
+      filterComplex = 'afftdn=nr=5:nf=-20:rn=0.005:rf=0.005,adeclick,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11';
+    }
+    const ffmpegArgs = [
+      '-i', inputPath,
+      '-c:a', 'libopus',
+      '-b:a', bitrate,
+      '-vbr', 'on',
+      '-compression_level', '10',
+      '-ar', sampleRate,
+      '-ac', '1',
+      '-application', 'voip',
+      '-filter_complex', filterComplex,
+      '-y',
+      outputPath
+    ];
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
     let stderr = '';
     ffmpeg.stderr.on('data', (data) => { stderr += data.toString(); });
@@ -157,23 +175,26 @@ async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
   });
 }
 
-async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
+// Адаптивные пресеты для видео-кружков:
+// - ultra: 320x320, 15fps, 80k  — EDGE/GPRS (кружок весит ~10 КБ/с)
+// - low:   480x480, 20fps, 120k — 2G/3G
+// - normal: 480x480, 20fps, 200k — 4G/WiFi
+async function optimizeVideoWithFFmpeg(inputPath, outputPath, preset = 'normal') {
   return new Promise((resolve, reject) => {
-    // ── ИДЕАЛЬНАЯ ПЛАВНОСТЬ И ОПТИМАЛЬНЫЙ ВЕС (Telegram-уровень) ──
-    // Переходим на H.264 с жестким контролем FPS и битрейта.
-    // - libx264: лучший кодек для широкой совместимости и контроля.
-    // - -preset veryfast: быстрый, но качественный пресет.
-    // - -profile:v main: широкая совместимость.
-    // - -crf 23: оптимальный баланс качества и размера для 720p.
-    // - -g 30: GOP (Group of Pictures) каждые 30 кадров для лучшей перемотки.
-    // - -keyint_min 30: минимальный интервал между ключевыми кадрами.
-    // - -sc_threshold 0: не создавать ключевые кадры при смене сцены (для стабильности).
-    // - -r 30: принудительно 30 FPS для плавности.
-    // - -b:v 400k: целевой битрейт 400 kbps (примерно 3 МБ/мин).
-    // - -maxrate 600k: максимальный битрейт.
-    // - -bufsize 800k: размер буфера.
-    // - -pix_fmt yuv420p: для лучшей совместимости.
-    // - -movflags +faststart: для быстрой загрузки в браузере.
+    let size, fps, videoBitrate, maxrate, bufsize, audioBitrate, audioRate;
+    if (preset === 'ultra') {
+      // EDGE/GPRS: минимальный размер и битрейт
+      size = '320:320'; fps = '15'; videoBitrate = '80k'; maxrate = '120k'; bufsize = '240k';
+      audioBitrate = '8k'; audioRate = '8000';
+    } else if (preset === 'low') {
+      // 2G/3G: средний размер
+      size = '480:480'; fps = '20'; videoBitrate = '120k'; maxrate = '180k'; bufsize = '360k';
+      audioBitrate = '16k'; audioRate = '16000';
+    } else {
+      // 4G/WiFi: стандарт
+      size = '480:480'; fps = '20'; videoBitrate = '200k'; maxrate = '300k'; bufsize = '600k';
+      audioBitrate = '24k'; audioRate = '24000';
+    }
     const ffmpegArgs = [
       '-i', inputPath,
       '-c:v', 'libx264',
@@ -183,17 +204,17 @@ async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
       '-g', '20',
       '-keyint_min', '20',
       '-sc_threshold', '0',
-      '-r', '20',
-      '-b:v', '200k',
-      '-maxrate', '300k',
-      '-bufsize', '600k',
+      '-r', fps,
+      '-b:v', videoBitrate,
+      '-maxrate', maxrate,
+      '-bufsize', bufsize,
       '-pix_fmt', 'yuv420p',
       '-movflags', '+faststart',
       '-c:a', 'libopus',
-      '-b:a', '24k',
-      '-ar', '24000',
+      '-b:a', audioBitrate,
+      '-ar', audioRate,
       '-ac', '1',
-      '-filter:v', 'fps=fps=20:round=near,scale=480:480:force_original_aspect_ratio=increase,crop=480:480',
+      '-filter:v', `fps=fps=${fps}:round=near,scale=${size}:force_original_aspect_ratio=increase,crop=${size}`,
       '-y',
       outputPath
     ];
@@ -227,12 +248,24 @@ function cleanupTemporaryFile(filepath) {
   try { if (fs.existsSync(filepath)) fs.unlinkSync(filepath); } catch (e) {}
 }
 
-async function processVoiceMessage(voiceData) {
+// preset определяется по размеру входного файла:
+// если голос уже маленький (записан на EDGE) — используем ultra
+async function processVoiceMessage(voiceData, preset = 'auto') {
   let inputPath, outputPath;
   try {
     inputPath = await saveTemporaryFile(voiceData, '.webm');
     outputPath = inputPath.replace('.webm', '-optimized.webm');
-    await optimizeAudioWithFFmpeg(inputPath, outputPath);
+    // Авто-определение пресета по размеру входного файла:
+    // Маленький файл = записан на слабой сети (ultra-сжатие уже применено)
+    if (preset === 'auto') {
+      const inputSize = fs.statSync(inputPath).size;
+      const durationEstSec = inputSize / 2000; // грубая оценка длительности
+      const bitrateKbps = (inputSize * 8) / (durationEstSec * 1000);
+      if (bitrateKbps < 20) preset = 'ultra';      // уже сжатый — применяем ultra
+      else if (bitrateKbps < 50) preset = 'low';   // среднее сжатие
+      else preset = 'normal';                       // стандарт
+    }
+    await optimizeAudioWithFFmpeg(inputPath, outputPath, preset);
     const optimizedData = fs.readFileSync(outputPath);
     const originalSize = fs.statSync(inputPath).size;
     const optimizedSize = fs.statSync(outputPath).size;
@@ -672,18 +705,33 @@ wss.on('connection', (ws) => {
               inputPath = await saveTemporaryFile(buffer, '.webm');
               outputPath = inputPath.replace('.webm', '-optimized.webm');
               
-              await optimizeVideoWithFFmpeg(inputPath, outputPath);
+              // Адаптивный пресет по размеру входного файла:
+              // Маленький файл = записан на EDGE/GPRS
+              const inputFileSize = Buffer.concat(
+                db.prepare(`SELECT data FROM file_chunks WHERE file_id=? ORDER BY chunk_index`)
+                  .all(data.fileId).map(c => Buffer.from(c.data, 'base64'))
+              ).length;
+              let vnPreset = 'normal';
+              if (inputFileSize < 500 * 1024) vnPreset = 'ultra';      // < 500 KB = EDGE
+              else if (inputFileSize < 2 * 1024 * 1024) vnPreset = 'low'; // < 2 MB = 3G
+              await optimizeVideoWithFFmpeg(inputPath, outputPath, vnPreset);
               
               const optimizedData = fs.readFileSync(outputPath);
-              const newTotalChunks = Math.ceil(optimizedData.length / (256 * 1024));
+              // Адаптивный размер чанка при пересборке:
+              // Маленький файл = используем 8 КБ чанки (для EDGE)
+              let reChunkSize;
+              if (vnPreset === 'ultra') reChunkSize = 8 * 1024;
+              else if (vnPreset === 'low') reChunkSize = 64 * 1024;
+              else reChunkSize = 256 * 1024;
+              const newTotalChunks = Math.ceil(optimizedData.length / reChunkSize);
               
               // Обновляем хедер и чанки
               db.transaction(() => {
                 stmtDeleteChunks.run(data.fileId);
                 db.prepare(`UPDATE file_headers SET size=?, total_chunks=? WHERE file_id=?`).run(optimizedData.length, newTotalChunks, data.fileId);
                 for (let i = 0; i < newTotalChunks; i++) {
-                  const start = i * (256 * 1024);
-                  const chunk = optimizedData.slice(start, start + (256 * 1024));
+                  const start = i * reChunkSize;
+                  const chunk = optimizedData.slice(start, start + reChunkSize);
                   stmtInsertChunk.run(data.fileId, i, chunk.toString('base64'), Date.now());
                 }
               })();
@@ -845,13 +893,28 @@ wss.on('connection', (ws) => {
       if(!target) return;
       const msgId = data.msgId;
       const payload = data.payload;
+      // ПРИОРИТЕТ ТЕКСТОВЫХ СООБЩЕНИЙ:
+      // Текстовые сообщения отправляются мгновенно, не ждут в очереди за файлами.
+      // Определяем является ли сообщение текстовым (payload не содержит файловых данных)
+      let isTextOnly = false;
+      try {
+        const p = typeof payload === 'string' ? JSON.parse(payload) : payload;
+        // Текстовое: нет media, voice, file, videoNote
+        isTextOnly = !p.media && !p.voice && !p.file && !p.videoNote && !p.sticker;
+      } catch(e) {}
       const eventId = enqueueEvent(target, 'incoming-msg', { from: myId, msgId, payload });
       const targetWs = peers.get(target);
       if(targetWs && targetWs.readyState === WebSocket.OPEN) {
-        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload, eventId });
+        // Текстовые сообщения отправляем мгновенно
+        send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload, eventId, priority: isTextOnly ? 'high' : 'normal' });
       } else {
         const queue = priorityQueues.get(target) || [];
-        queue.push({ type: 'incoming-msg', from: myId, msgId, payload, eventId });
+        // Текстовые сообщения добавляем в начало очереди (перед файлами)
+        if (isTextOnly) {
+          queue.unshift({ type: 'incoming-msg', from: myId, msgId, payload, eventId, priority: 'high' });
+        } else {
+          queue.push({ type: 'incoming-msg', from: myId, msgId, payload, eventId, priority: 'normal' });
+        }
         priorityQueues.set(target, queue);
         sendPush(target, `💬 ${myId}`);
       }
