@@ -96,6 +96,7 @@ const stmtGetHeader       = db.prepare(`SELECT * FROM file_headers WHERE file_id
 const stmtCountChunks     = db.prepare(`SELECT COUNT(*) as cnt FROM file_chunks WHERE file_id=?`);
 const stmtDeleteChunks    = db.prepare(`DELETE FROM file_chunks WHERE file_id=?`);
 const stmtDeleteHeader    = db.prepare(`DELETE FROM file_headers WHERE file_id=?`);
+const stmtGetReceivedChunks = db.prepare(`SELECT chunk_index FROM file_chunks WHERE file_id=? ORDER BY chunk_index ASC`);
 const stmtGetPendingFiles = db.prepare(`SELECT * FROM file_headers WHERE recipient_id=?`);
 
 const stmtDeleteFileAvail = db.prepare(`
@@ -135,10 +136,10 @@ async function optimizeAudioWithFFmpeg(inputPath, outputPath) {
       const ffmpegArgs = [
         '-i', inputPath,
         '-c:a', 'libopus',
-        '-b:a', '192k',
+        '-b:a', '16k',
         '-vbr', 'on',
         '-compression_level', '10',
-        '-ar', '48000',
+        '-ar', '16000',
         '-ac', '1',
         '-application', 'audio',
         '-filter_complex', 'afftdn=nr=5:nf=-20:rn=0.005:rf=0.005,adeclick,acompressor=ratio=2:attack=3:release=30:threshold=-18:detection=peak,loudnorm=I=-16:TP=-1.5:LRA=11',
@@ -178,21 +179,21 @@ async function optimizeVideoWithFFmpeg(inputPath, outputPath) {
       '-c:v', 'libx264',
       '-preset', 'veryfast',
       '-profile:v', 'main',
-      '-crf', '23', // Оптимальный баланс качества и размера для 720p
-      '-g', '30',
-      '-keyint_min', '30',
+      '-crf', '32',
+      '-g', '15',
+      '-keyint_min', '15',
       '-sc_threshold', '0',
-      '-r', '30',
-      '-b:v', '400k', // Целевой битрейт 400 kbps (~3 МБ/мин)
-      '-maxrate', '600k', // Максимальный битрейт
-      '-bufsize', '800k', // Размер буфера
-      '-pix_fmt', 'yuv420p', // Для лучшей совместимости
-      '-movflags', '+faststart', // Для быстрой загрузки в браузере
+      '-r', '15',
+      '-b:v', '120k',
+      '-maxrate', '180k',
+      '-bufsize', '300k',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
       '-c:a', 'libopus',
-      '-b:a', '128k',
-      '-ar', '48000',
+      '-b:a', '12k',
+      '-ar', '16000',
       '-ac', '1',
-      '-filter:v', 'fps=fps=30:round=near,scale=640:640:force_original_aspect_ratio=increase,crop=640:640', // Жесткая стабилизация FPS и квадрат для кружка
+      '-filter:v', 'fps=fps=15:round=near,scale=320:320:force_original_aspect_ratio=increase,crop=320:320',
       '-y',
       outputPath
     ];
@@ -275,12 +276,12 @@ const MAX_CONNS_PER_IP = 8;
 const wss = new WebSocket.Server({
   port: PORT,
   maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
-  perMessageDeflate: {
-    zlibDeflateOptions: { level: 3 },
-    zlibInflateOptions: { chunkSize: 10 * 1024 },
+    perMessageDeflate: {
+    zlibDeflateOptions: { level: 6 }, // Чуть выше уровень сжатия для экономии трафика
+    zlibInflateOptions: { chunkSize: 16 * 1024 },
     clientNoContextTakeover: true,
     serverNoContextTakeover: true,
-    threshold: 512
+    threshold: 128 // Сжимаем даже маленькие JSON-пакеты
   },
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
@@ -303,7 +304,8 @@ const activeFetchers = new Map();
 const heartbeats = new Map();
 // ОПТИМИЗАЦИЯ 5: HEARTBEAT_TIMEOUT = 90с (было 600с = 10 минут!)
 // На 2G/3G соединение может «зависнуть» без явного разрыва — теперь это обнаруживается за 90с.
-const HEARTBEAT_TIMEOUT = 90_000;    // 90 секунд
+// АДАПТИВНЫЙ ТАЙМАУТ: Увеличиваем до 120с для 2G, чтобы не разрывать связь при долгих задержках
+const HEARTBEAT_TIMEOUT = 120_000;
 
 // Rate limiting: не более 30 сообщений в секунду с одного подключения
 const rateLimits = new Map();
@@ -447,11 +449,20 @@ wss.on('connection', (ws) => {
     if(myId) resetHeartbeat(myId);
 
     // ── Регистрация ──────────────────────────────────────────────────────────
-    if(data.type === 'register') {
-      const newId = (data.peerId || '').toLowerCase().trim();
+    if (data.type === 'ping') {
+      send(ws, { type: 'pong' });
+      return;
+    }
+
+    if(data.type === 'register' || data.type === 'auth') {
+      const newId = (data.peerId || data.id || '').toLowerCase().trim();
       if(!newId) return;
       const old = peers.get(newId);
-      if(old && old !== ws && old.readyState === WebSocket.OPEN) old.close();
+      if(old && old !== ws && old.readyState === WebSocket.OPEN) {
+        // Если заходит тот же пользователь с другого сокета, мягко закрываем старый
+        old.onclose = null;
+        old.close(1000, 'New session started');
+      }
       myId = newId;
       peers.set(myId, ws);
       send(ws, { type: 'registered' });
@@ -514,6 +525,24 @@ wss.on('connection', (ws) => {
       const rows = db.prepare('SELECT * FROM events WHERE recipient_id=? AND id > ? ORDER BY id ASC').all(myId, sinceId);
       for (const r of rows) {
         send(ws, { type: r.type, ...JSON.parse(r.payload), eventId: r.id });
+      }
+      return;
+    }
+
+    if (data.type === 'get-file-status') {
+      if (!myId) return;
+      const header = stmtGetHeader.get(data.fileId);
+      if (!header) {
+        send(ws, { type: 'file-status', fileId: data.fileId, exists: false });
+      } else {
+        const received = stmtGetReceivedChunks.all(data.fileId).map(r => r.chunk_index);
+        send(ws, { 
+          type: 'file-status', 
+          fileId: data.fileId, 
+          exists: true, 
+          receivedChunks: received,
+          totalChunks: header.total_chunks
+        });
       }
       return;
     }
