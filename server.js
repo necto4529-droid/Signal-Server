@@ -270,9 +270,18 @@ cleanupOldFiles();
 const PORT = process.env.PORT || 3000;
 const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
 const MAX_CONNS_PER_IP = 8;
+// ОПТИМИЗАЦИЯ 2: perMessageDeflate — сжатие каждого WS-фрейма (уровень 3, быстрое)
+// Для JSON-сообщений даёт 70-80% сжатие. Особенно важно на 2G где каждый байт на счету.
 const wss = new WebSocket.Server({
   port: PORT,
   maxPayload: 1024 * 1024 * 1024,  // 1 ГБ
+  perMessageDeflate: {
+    zlibDeflateOptions: { level: 3 },
+    zlibInflateOptions: { chunkSize: 10 * 1024 },
+    clientNoContextTakeover: true,
+    serverNoContextTakeover: true,
+    threshold: 512
+  },
   verifyClient: (info) => {
     const ip = info.req.socket.remoteAddress || 'unknown';
     let count = 0;
@@ -292,7 +301,9 @@ const peers = new Map();
 // Когда прилетает новый чанк, мы пушим его всем подписчикам.
 const activeFetchers = new Map();
 const heartbeats = new Map();
-const HEARTBEAT_TIMEOUT = 600_000;   // 10 минут
+// ОПТИМИЗАЦИЯ 5: HEARTBEAT_TIMEOUT = 90с (было 600с = 10 минут!)
+// На 2G/3G соединение может «зависнуть» без явного разрыва — теперь это обнаруживается за 90с.
+const HEARTBEAT_TIMEOUT = 90_000;    // 90 секунд
 
 // Rate limiting: не более 30 сообщений в секунду с одного подключения
 const rateLimits = new Map();
@@ -375,21 +386,63 @@ function removeMember(groupId, peerId) {
 }
 
 // ─── Соединения ──────────────────────────────────────────────────────────────
+// ОПТИМИЗАЦИЯ 4: Активный ping/pong — сервер шлёт нативный WS ping каждые 30с,
+// ждёт pong 20с. Если pong не пришёл — terminate(). Клиент сразу получает onclose и начинает reconnect.
+const PING_INTERVAL = 30_000;  // 30 секунд
+const PONG_TIMEOUT  = 20_000;  // 20 секунд
+
 wss.on('connection', (ws) => {
+  // ОПТИМИЗАЦИЯ 3: TCP keepalive — быстрое обнаружение «зависших» соединений
   ws._socket.setTimeout(0);
-  ws._socket.setNoDelay(true);
-  ws._socket.setKeepAlive(true, 60000);
+  ws._socket.setNoDelay(true);      // Отключаем алгоритм Нагла — меньше задержка пакетов
+  ws._socket.setKeepAlive(true, 15000); // Кеепалайв каждые 15с (было 60с)
+
+  // ОПТИМИЗАЦИЯ 4: Активный ping/pong
+  let _pingTimer = null;
+  let _pongTimer = null;
+  function _schedulePing() {
+    _pingTimer = setTimeout(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try { ws.ping(); } catch(e) {}
+      _pongTimer = setTimeout(() => {
+        console.log('[Ping] No pong received, terminating connection');
+        try { ws.terminate(); } catch(e) {}
+      }, PONG_TIMEOUT);
+    }, PING_INTERVAL);
+  }
+  ws.on('pong', () => {
+    clearTimeout(_pongTimer);
+    _schedulePing();
+  });
+  _schedulePing();
 
   let myId = null;
 
-  ws.on('message', async (raw) => {
-    if (!checkRateLimit(ws)) {
-      ws.close(4001, 'Rate limit exceeded');
-      return;
-    }
+    // УЛЬТИМАТИВНАЯ ОПТИМИЗАЦИЯ: Request-Response Deduplication
+    const processedRequests = new Set();
+    
+    ws.on('message', async (raw) => {
+      if (!checkRateLimit(ws)) {
+        ws.close(4001, 'Rate limit exceeded');
+        return;
+      }
+  
+      let data;
+      try { data = JSON.parse(raw); } catch { return; }
 
-    let data;
-    try { data = JSON.parse(raw); } catch { return; }
+      // Дедупликация: если этот requestId уже обрабатывался в рамках текущей сессии — игнорируем
+      if (data.requestId) {
+        if (processedRequests.has(data.requestId)) {
+          console.log(`[Dedup] Skipping duplicate request: ${data.requestId}`);
+          return;
+        }
+        processedRequests.add(data.requestId);
+        // Ограничиваем размер кэша дедупликации
+        if (processedRequests.size > 500) {
+          const first = processedRequests.values().next().value;
+          processedRequests.delete(first);
+        }
+      }
 
     if(myId) resetHeartbeat(myId);
 
@@ -404,9 +457,11 @@ wss.on('connection', (ws) => {
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
       resetHeartbeat(myId);
-
+  
       flushPriorityQueue(myId);
-
+      
+      // Delta-Sync теперь управляется отдельным типом сообщения,
+      // но при первой регистрации мы всё равно шлём последние события.
       const rows = stmtGetEvents.all(myId);
       const events = rows.map(r => ({
         id: r.id,
@@ -448,6 +503,18 @@ wss.on('connection', (ws) => {
       if(!myId || !data.playerId) return;
       pushSubs[myId] = data.playerId;
       try { fs.writeFileSync(pushFile, JSON.stringify(pushSubs)); } catch(e) {}
+      return;
+    }
+
+    // УЛЬТИМАТИВНАЯ ОПТИМИЗАЦИЯ: Delta-Sync Handler
+    if (data.type === 'delta-sync') {
+      if (!myId) return;
+      const sinceId = parseInt(data.sinceId) || 0;
+      // Выбираем только те события, которые клиент ещё не получал
+      const rows = db.prepare('SELECT * FROM events WHERE recipient_id=? AND id > ? ORDER BY id ASC').all(myId, sinceId);
+      for (const r of rows) {
+        send(ws, { type: r.type, ...JSON.parse(r.payload), eventId: r.id });
+      }
       return;
     }
 
@@ -911,6 +978,9 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    // Очищаем ping/pong таймеры при закрытии соединения
+    clearTimeout(_pingTimer);
+    clearTimeout(_pongTimer);
     if(myId) {
       clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
@@ -933,6 +1003,30 @@ wss.on('connection', (ws) => {
 
 // ─── Health‑check /stats endpoint ────────────────────────────────────────────
 const STATS_TOKEN = process.env.STATS_TOKEN || '';
+// ОПТИМИЗАЦИЯ 6: gzip сжатие HTTP fallback — уменьшает трафик в 3-5 раз
+const zlib = require('zlib');
+function _sendGzip(req, res, statusCode, headers, body) {
+  const acceptEncoding = req.headers['accept-encoding'] || '';
+  if (acceptEncoding.includes('gzip')) {
+    zlib.gzip(Buffer.isBuffer(body) ? body : Buffer.from(body), (err, compressed) => {
+      if (err) {
+        res.writeHead(statusCode, headers);
+        res.end(body);
+        return;
+      }
+      res.writeHead(statusCode, {
+        ...headers,
+        'Content-Encoding': 'gzip',
+        'Content-Length': compressed.length
+      });
+      res.end(compressed);
+    });
+  } else {
+    res.writeHead(statusCode, headers);
+    res.end(body);
+  }
+}
+
 const healthServer = http.createServer((req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -944,11 +1038,11 @@ const healthServer = http.createServer((req, res) => {
       return res.end('Forbidden');
     }
     const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM events').get().cnt;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    const body = JSON.stringify({
       activeConnections: peers.size,
       queuedEvents: eventCount
-    }));
+    });
+    _sendGzip(req, res, 200, { 'Content-Type': 'application/json' }, body);
   } else {
     res.writeHead(404);
     res.end();
