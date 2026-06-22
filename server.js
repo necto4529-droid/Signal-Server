@@ -304,6 +304,17 @@ cleanupOldFiles();
 const PORT = process.env.PORT || 3000;
 const HEALTH_PORT = process.env.HEALTH_PORT || 8080;
 const MAX_CONNS_PER_IP = 8;
+
+// ИСПРАВЛЕНИЕ: Очередь для последовательной записи чанков (Race Condition Fix)
+const chunkQueues = new Map();
+async function enqueueChunkWrite(fileId, writeFn) {
+  if (!chunkQueues.has(fileId)) chunkQueues.set(fileId, Promise.resolve());
+  const promise = chunkQueues.get(fileId).then(writeFn);
+  chunkQueues.set(fileId, promise);
+  // Очистка очереди после завершения
+  promise.finally(() => { if (chunkQueues.get(fileId) === promise) chunkQueues.delete(fileId); });
+  return promise;
+}
 // ОПТИМИЗАЦИЯ 2: perMessageDeflate — сжатие каждого WS-фрейма (уровень 3, быстрое)
 // Для JSON-сообщений даёт 70-80% сжатие. Особенно важно на 2G где каждый байт на счету.
 const wss = new WebSocket.Server({
@@ -633,10 +644,15 @@ wss.on('connection', (ws) => {
       const header = stmtGetHeader.get(data.fileId);
       if(!header) return;
 
-      // ОПТИМИЗАЦИЯ 4: Сохраняем чанки как есть (сервер НЕ склеивает)
-      for(const chunk of chunks) {
-        stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
-      }
+      // ИСПРАВЛЕНИЕ: Последовательная запись через очередь (Race Condition Fix)
+      await enqueueChunkWrite(data.fileId, async () => {
+        const runTransaction = db.transaction((chunksData) => {
+          for(const chunk of chunksData) {
+            stmtInsertChunk.run(data.fileId, chunk.index, chunk.data, Date.now());
+          }
+        });
+        runTransaction(chunks);
+      });
 
       const cnt = stmtCountChunks.get(data.fileId);
       const receivedCount = cnt ? cnt.cnt : 0;
@@ -726,15 +742,16 @@ wss.on('connection', (ws) => {
               const newTotalChunks = Math.ceil(optimizedData.length / reChunkSize);
               
               // Обновляем хедер и чанки
-              db.transaction(() => {
+              const updateVnTransaction = db.transaction((optData, reSize, total) => {
                 stmtDeleteChunks.run(data.fileId);
-                db.prepare(`UPDATE file_headers SET size=?, total_chunks=? WHERE file_id=?`).run(optimizedData.length, newTotalChunks, data.fileId);
-                for (let i = 0; i < newTotalChunks; i++) {
-                  const start = i * reChunkSize;
-                  const chunk = optimizedData.slice(start, start + reChunkSize);
+                db.prepare(`UPDATE file_headers SET size=?, total_chunks=? WHERE file_id=?`).run(optData.length, total, data.fileId);
+                for (let i = 0; i < total; i++) {
+                  const start = i * reSize;
+                  const chunk = optData.slice(start, start + reSize);
                   stmtInsertChunk.run(data.fileId, i, chunk.toString('base64'), Date.now());
                 }
-              })();
+              });
+              updateVnTransaction(optimizedData, reChunkSize, newTotalChunks);
               
               const updatedHeader = stmtGetHeader.get(data.fileId);
               const payload = {
@@ -1120,11 +1137,7 @@ function _sendGzip(req, res, statusCode, headers, body) {
 }
 
 const healthServer = http.createServer((req, res) => {
-  if (req.url === '/ping') {
-    // Эндпоинт для замера задержки сети (работает в Median.co и браузерах)
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, ts: Date.now() }));
-  } else if (req.url === '/health') {
+  if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
   } else if (req.url === '/stats' && STATS_TOKEN) {
