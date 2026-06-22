@@ -707,6 +707,23 @@ wss.on('connection', (ws) => {
         if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
           send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
         }
+        // БАГ-ФИКС: PUSH-стриминг промежуточных чанков получателю если он сейчас скачивает файл
+        // Это устраняет задержку при загрузке видео-кружков и файлов — не нужно ждать таймаут retry
+        const midFetchers = activeFetchers.get(data.fileId);
+        if(midFetchers && midFetchers.size > 0) {
+          data.chunks.forEach(c => {
+            const chunkMsg = {
+              type: 'file-data-chunk',
+              fileId: data.fileId,
+              index: c.index,
+              total: header.total_chunks,
+              data: c.data
+            };
+            midFetchers.forEach(fws => {
+              if(fws.readyState === WebSocket.OPEN) send(fws, chunkMsg);
+            });
+          });
+        }
       }
 
       // Проверяем завершение загрузки
@@ -872,9 +889,10 @@ wss.on('connection', (ws) => {
       });
 
       // Отправляем те чанки, которые УЖЕ есть в базе
+      // БАГ-ФИКС: передаём total чтобы клиент мог правильно инициализировать массив чанков
       for(const chunk of chunks) {
         if(chunk.chunk_index >= fromIndex) {
-          send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, data: chunk.data });
+          send(ws, { type: 'file-data-chunk', fileId, index: chunk.chunk_index, total: header.total_chunks, data: chunk.data });
         }
       }
       return;
