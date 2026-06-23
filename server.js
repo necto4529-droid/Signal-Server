@@ -432,10 +432,11 @@ function removeMember(groupId, peerId) {
 }
 
 // ─── Соединения ──────────────────────────────────────────────────────────────
-// ОПТИМИЗАЦИЯ 4: Активный ping/pong — сервер шлёт нативный WS ping каждые 30с,
-// ждёт pong 20с. Если pong не пришёл — terminate(). Клиент сразу получает onclose и начинает reconnect.
-const PING_INTERVAL = 30_000;  // 30 секунд
-const PONG_TIMEOUT  = 20_000;  // 20 секунд
+// ОПТИМИЗАЦИЯ 4: Активный ping/pong — сервер шлёт нативный WS ping каждые 60с,
+// ждёт pong 40с. На мобильных сетях (2G/3G) задержки могут быть большие.
+// ИСПРАВЛЕНИЕ: Увеличили интервалы, чтобы избежать ложных разрывов соединения.
+const PING_INTERVAL = 60_000;  // 60 секунд (было 30)
+const PONG_TIMEOUT  = 40_000;  // 40 секунд (было 20)
 
 wss.on('connection', (ws) => {
   // ОПТИМИЗАЦИЯ 3: TCP keepalive — быстрое обнаружение «зависших» соединений
@@ -457,7 +458,8 @@ wss.on('connection', (ws) => {
     }, PING_INTERVAL);
   }
   ws.on('pong', () => {
-    clearTimeout(_pongTimer);
+    if(_pongTimer) clearTimeout(_pongTimer);
+    _pongTimer = null;
     _schedulePing();
   });
   _schedulePing();
@@ -490,9 +492,11 @@ wss.on('connection', (ws) => {
         }
       }
 
-    if(myId) resetHeartbeat(myId);
+    // ИСПРАВЛЕНИЕ: НЕ вызываем resetHeartbeat при каждом сообщении
+    // Это конфликтует с активным ping/pong и может привести к разрывам
+    // if(myId) resetHeartbeat(myId);
 
-    // ── Регистрация ──────────────────────────────────────────────────────────
+    // ── Регистрация ──────────────────────────────────────────────────────────────
     if (data.type === 'ping') {
       send(ws, { type: 'pong' });
       return;
@@ -511,7 +515,8 @@ wss.on('connection', (ws) => {
       peers.set(myId, ws);
       send(ws, { type: 'registered' });
       broadcastPresence(myId, true);
-      resetHeartbeat(myId);
+      // ИСПРАВЛЕНИЕ: Не используем resetHeartbeat — используем только активный ping/pong
+      // resetHeartbeat(myId);
   
       flushPriorityQueue(myId);
       
@@ -1088,10 +1093,12 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     // Очищаем ping/pong таймеры при закрытии соединения
-    clearTimeout(_pingTimer);
-    clearTimeout(_pongTimer);
+    if(_pingTimer) clearTimeout(_pingTimer);
+    if(_pongTimer) clearTimeout(_pongTimer);
+    _pingTimer = null;
+    _pongTimer = null;
     if(myId) {
-      clearTimeout(heartbeats.get(myId));
+      if(heartbeats.has(myId)) clearTimeout(heartbeats.get(myId));
       heartbeats.delete(myId);
       if(peers.get(myId) === ws) { 
         peers.delete(myId); 
