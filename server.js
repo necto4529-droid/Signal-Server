@@ -4,6 +4,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
+const crypto = require('crypto');
 const { spawn } = require('child_process');
 const os = require('os');
 
@@ -381,8 +382,52 @@ setInterval(() => {
 
 const priorityQueues = new Map();
 
+// ─── МАСКИРОВКА ТРАФИКА (BINARY OBFUSCATION) ────────────────────────────────
+const MAGIC_BYTE = 0x4B; // 'K'
+
+function encodeMessage(obj) {
+  const json = JSON.stringify(obj);
+  const data = Buffer.from(json, 'utf8');
+  const keyLen = 4 + Math.floor(Math.random() * 8); // Динамический ключ 4-12 байт
+  const key = crypto.randomBytes(keyLen);
+  
+  const buffer = Buffer.alloc(2 + keyLen + data.length);
+  buffer[0] = MAGIC_BYTE;
+  buffer[1] = keyLen;
+  key.copy(buffer, 2);
+  
+  for (let i = 0; i < data.length; i++) {
+    buffer[2 + keyLen + i] = data[i] ^ key[i % keyLen];
+  }
+  return buffer;
+}
+
+function decodeMessage(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 2 || buffer[0] !== MAGIC_BYTE) {
+    return null;
+  }
+  const keyLen = buffer[1];
+  if (buffer.length < 2 + keyLen) return null;
+  
+  const key = buffer.slice(2, 2 + keyLen);
+  const encryptedData = buffer.slice(2 + keyLen);
+  const data = Buffer.alloc(encryptedData.length);
+  
+  for (let i = 0; i < encryptedData.length; i++) {
+    data[i] = encryptedData[i] ^ key[i % keyLen];
+  }
+  
+  try {
+    return JSON.parse(data.toString('utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
 function send(ws, obj) {
-  if(ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  if(ws?.readyState === WebSocket.OPEN) {
+    ws.send(encodeMessage(obj));
+  }
 }
 
 function flushPriorityQueue(userId) {
@@ -391,15 +436,16 @@ function flushPriorityQueue(userId) {
   const queue = priorityQueues.get(userId) || [];
   while(queue.length > 0) {
     const msg = queue.shift();
-    try { ws.send(JSON.stringify(msg)); } catch(e) { break; }
+    try { ws.send(encodeMessage(msg)); } catch(e) { break; }
   }
   if(queue.length === 0) priorityQueues.delete(userId);
   else priorityQueues.set(userId, queue);
 }
 
 function broadcastPresence(peerId, isOnline) {
-  const msg = JSON.stringify({ type: 'presence', peerId, online: isOnline });
-  for(const [, ws] of peers) if(ws.readyState === WebSocket.OPEN) ws.send(msg);
+  const msgObj = { type: 'presence', peerId, online: isOnline };
+  const encoded = encodeMessage(msgObj);
+  for(const [, ws] of peers) if(ws.readyState === WebSocket.OPEN) ws.send(encoded);
 }
 function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
@@ -476,7 +522,14 @@ wss.on('connection', (ws) => {
       }
   
       let data;
-      try { data = JSON.parse(raw); } catch { return; }
+      // Пробуем расшифровать бинарное сообщение
+      if (Buffer.isBuffer(raw)) {
+        data = decodeMessage(raw);
+      } else {
+        // Если пришел текст (для обратной совместимости или ошибок), пробуем JSON
+        try { data = JSON.parse(raw); } catch { return; }
+      }
+      if (!data) return;
 
       // Дедупликация: если этот requestId уже обрабатывался в рамках текущей сессии — игнорируем
       if (data.requestId) {
