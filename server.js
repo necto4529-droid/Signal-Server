@@ -583,29 +583,28 @@ wss.on('connection', (ws) => {
       }));
       for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
 
-      // ОПТИМИЗАЦИЯ 3: при reconnect показываем файлы которые уже начали загружаться
-      // (даже если ещё не все чанки получены — клиент увидит thumb сразу)
+      // ИСПРАВЛЕНИЕ: при reconnect показываем file-available с thumb ТОЛЬКО если файл полностью загружен.
+      // Если файл ещё загружается — отправляем file-available БЕЗ thumb (чтобы получатель
+      // знал о файле, но миниатюра не показывалась до завершения загрузки).
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
         const cnt = stmtCountChunks.get(h.file_id);
-        // Показываем file-available если есть хотя бы 1 чанк (стриминг)
-        // или если файл полностью загружен
-        if(cnt && cnt.cnt >= 1) {
-          send(ws, {
-            type: 'file-available',
-            fileId: h.file_id,
-            senderId: h.sender_id,
-            name: h.name,
-            size: h.size,
-            mimeType: h.mime_type,
-            totalChunks: h.total_chunks,
-            caption: h.caption,
-            thumb: h.thumb || '',
-            ts: h.ts,
-            // ОПТИМИЗАЦИЯ 4: сообщаем клиенту сколько чанков уже есть
-            chunksReady: cnt.cnt
-          });
-        }
+        if(!cnt || cnt.cnt < 1) continue;
+        const isComplete = cnt.cnt >= h.total_chunks;
+        send(ws, {
+          type: 'file-available',
+          fileId: h.file_id,
+          senderId: h.sender_id,
+          name: h.name,
+          size: h.size,
+          mimeType: h.mime_type,
+          totalChunks: h.total_chunks,
+          caption: h.caption,
+          // Миниатюра передаётся ТОЛЬКО если файл полностью загружен
+          thumb: isComplete ? (h.thumb || '') : '',
+          ts: h.ts,
+          chunksReady: cnt.cnt
+        });
       }
       return;
     }
@@ -715,52 +714,12 @@ wss.on('connection', (ws) => {
       const cnt = stmtCountChunks.get(data.fileId);
       const receivedCount = cnt ? cnt.cnt : 0;
 
-      // ОПТИМИЗАЦИЯ 3: Отправляем file-available получателю СРАЗУ после первого чанка
-      // Не ждём пока все чанки загрузятся — получатель начнёт скачивать параллельно
-      if(receivedCount === chunks.length && receivedCount >= 1) {
-        // Это первый батч чанков — сигнализируем получателю немедленно
-        const payload = {
-          fileId: data.fileId,
-          senderId: myId,
-          name: header.name,
-          size: header.size,
-          mimeType: header.mime_type,
-          totalChunks: header.total_chunks,
-          caption: header.caption,
-          // ОПТИМИЗАЦИЯ 1: передаём thumb в уведомлении
-          thumb: header.thumb || '',
-          ts: header.ts,
-          // ОПТИМИЗАЦИЯ 4: сообщаем сколько чанков уже готово
-          chunksReady: receivedCount
-        };
-
-        const recipientWs = peers.get(header.recipient_id);
-
-        // Проверяем: уже ли отправляли file-available этому получателю для этого файла?
-        const alreadyNotified = db.prepare(
-          `SELECT id FROM events WHERE recipient_id=? AND type='file-available' AND json_extract(payload,'$.fileId')=? LIMIT 1`
-        ).get(header.recipient_id, data.fileId);
-
-        if(!alreadyNotified) {
-          // Первый раз — сохраняем в очередь и отправляем
-          const eventId = enqueueEvent(header.recipient_id, 'file-available', payload);
-          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-            flushPriorityQueue(header.recipient_id);
-            send(recipientWs, { type: 'file-available', ...payload, eventId });
-          } else {
-            const queue = priorityQueues.get(header.recipient_id) || [];
-            queue.push({ type: 'file-available', ...payload, eventId });
-            priorityQueues.set(header.recipient_id, queue);
-            sendPush(header.recipient_id, `📎 ${header.name}`);
-          }
-        } else {
-          // Уже уведомляли — просто обновляем chunksReady у получателя если он онлайн
-          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-            send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
-          }
-        }
-      } else if(receivedCount > chunks.length) {
-        // Последующие батчи — обновляем получателя о прогрессе
+      // ИСПРАВЛЕНИЕ: НЕ отправляем file-available (с миниатюрой) до полной загрузки файла.
+      // Пока файл загружается — шлём только file-chunks-update (прогресс без thumb).
+      // file-available с thumb отправляется ТОЛЬКО когда receivedCount >= total_chunks
+      // (т.е. отправитель полностью загрузил файл на сервер).
+      if(receivedCount < header.total_chunks) {
+        // Файл ещё не загружен полностью — только обновляем прогресс у получателя
         const recipientWs = peers.get(header.recipient_id);
         if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
           send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
@@ -869,29 +828,52 @@ wss.on('connection', (ws) => {
           });
         }
 
-        // Обычный файл — отправляем file-upload-complete отправителю
-        // file-available уже был отправлен получателю после первого чанка
-        // Обновляем chunksReady до финального значения
+        // ИСПРАВЛЕНИЕ: Файл полностью загружен — ТЕПЕРЬ отправляем file-available с thumb получателю.
+        // Миниатюра появляется ТОЛЬКО после полной 100% загрузки отправителя.
+        const completePayload = {
+          fileId: data.fileId,
+          senderId: myId,
+          name: header.name,
+          size: header.size,
+          mimeType: header.mime_type,
+          totalChunks: header.total_chunks,
+          caption: header.caption,
+          thumb: header.thumb || '',
+          ts: header.ts,
+          chunksReady: receivedCount
+        };
         const recipientWs = peers.get(header.recipient_id);
-        if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-          send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: receivedCount, totalChunks: header.total_chunks });
+        // Проверяем: уже ли отправляли file-available этому получателю для этого файла?
+        const alreadyNotified = db.prepare(
+          `SELECT id FROM events WHERE recipient_id=? AND type='file-available' AND json_extract(payload,'$.fileId')=? LIMIT 1`
+        ).get(header.recipient_id, data.fileId);
+        if(!alreadyNotified) {
+          // Первый раз — сохраняем в очередь и отправляем
+          const eventId = enqueueEvent(header.recipient_id, 'file-available', completePayload);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            flushPriorityQueue(header.recipient_id);
+            send(recipientWs, { type: 'file-available', ...completePayload, eventId });
+          } else {
+            const queue = priorityQueues.get(header.recipient_id) || [];
+            queue.push({ type: 'file-available', ...completePayload, eventId });
+            priorityQueues.set(header.recipient_id, queue);
+            sendPush(header.recipient_id, `📎 ${header.name}`);
+          }
+        } else {
+          // Уже уведомляли — обновляем событие в очереди и отправляем обновленное сообщение с thumb
+          stmtDeleteFileAvail.run(header.recipient_id, data.fileId);
+          const eventId = enqueueEvent(header.recipient_id, 'file-available', completePayload);
+          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            send(recipientWs, { type: 'file-available', ...completePayload, eventId });
+          }
         }
 
-        // ФИКС: Отправляем уведомление о завершении загрузки
+        // Отправляем уведомление о завершении загрузки отправителю
         send(ws, { type: 'file-upload-complete', fileId: data.fileId });
         
         // ИСПРАВЛЕНИЕ БАГА: НЕ отправляем file-delivered автоматически при завершении загрузки на сервер.
         // file-delivered должен приходить ТОЛЬКО когда получатель реально скачал файл
         // (через file-available-ack или через зашифрованный сигнал от получателя).
-        // Иначе у отправителя сразу ставится ✔✔ даже если получатель офлайн.
-        
-        // Форсируем уведомление получателя о финальном количестве чанков (если он онлайн)
-        setTimeout(() => {
-          const recipientWs = peers.get(header.recipient_id);
-          if(recipientWs && recipientWs.readyState === WebSocket.OPEN) {
-            send(recipientWs, { type: 'file-chunks-update', fileId: data.fileId, chunksReady: header.total_chunks, totalChunks: header.total_chunks });
-          }
-        }, 100);
       } else {
         send(ws, { type: 'store-chunks-ack', fileId: data.fileId });
       }
