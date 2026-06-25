@@ -1046,9 +1046,22 @@ wss.on('connection', (ws) => {
       if(!target) return;
       const msgId = data.msgId;
       const payload = data.payload;
+
+      // ИСПРАВЛЕНИЕ: ephemeral-сообщения (typing, activity) НЕ сохраняем в БД и НЕ добавляем в очередь.
+      // Если получатель офлайн — епхемеральный статус дропаем (как в Telegram).
+      if (data.ephemeral) {
+        // Только пересылаем если получатель онлайн — в очередь НЕ кладём
+        const targetWs = peers.get(target);
+        if(targetWs && targetWs.readyState === WebSocket.OPEN) {
+          send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload });
+        }
+        // Если офлайн — молча дропаем (устаревший статус не нужен)
+        return;
+      }
+
       // ПРИОРИТЕТ ТЕКСТОВЫХ СООБЩЕНИЙ:
       // Текстовые сообщения отправляются мгновенно, не ждут в очереди за файлами.
-      // Определяем является ли сообщение текстовым (payload не содержит файловых данных)
+      // Определяем является ли сообщение текстовым (пайлоад не содержит файловых данных)
       let isTextOnly = false;
       try {
         const p = typeof payload === 'string' ? JSON.parse(payload) : payload;
