@@ -663,12 +663,26 @@ wss.on('connection', (ws) => {
       // ИСПРАВЛЕНИЕ: Не используем resetHeartbeat — используем только активный ping/pong
       // resetHeartbeat(myId);
   
-      flushPriorityQueue(myId);
-      
-      // ГАРАНТИРОВАННАЯ ДОСТАВКА: При подключении отправляем ВСЕ накопленные события
-      // Аналог Telegram — все офлайн-сообщения приходят при первом же подключении
-      // flushEventsToUser обновляет retry_count и last_retry для каждого события
+      // ИСПРАВЛЕНИЕ СЕРВЕРНОГО ДУБЛЯ:
+      // Порядок при reconnect:
+      //   1. Сначала отправляем ВСЕ события из БД (flushEventsToUser) — это единственный
+      //      авторитетный источник истины. Каждое событие несёт свой eventId.
+      //   2. Затем сбрасываем priorityQueue, пропуская сообщения, которые уже есть в БД
+      //      (т.е. уже были отправлены через flushEventsToUser).
+      // Это исключает «тройной» инкремент: одно и то же incoming-msg не придёт
+      // дважды из памяти и БД одновременно.
       flushEventsToUser(myId, ws);
+      // Собираем eventId всех событий, уже отправленных из БД
+      const _dbEventIds = new Set(stmtGetEvents.all(myId).map(e => e.id));
+      // Сбрасываем priorityQueue, исключая дубли (сообщения уже в БД)
+      const _pq = priorityQueues.get(myId) || [];
+      const _pqFiltered = _pq.filter(m => !m.eventId || !_dbEventIds.has(m.eventId));
+      if (_pqFiltered.length > 0) {
+        for (const _m of _pqFiltered) {
+          try { ws.send(encodeMessage(_m)); } catch(e) { break; }
+        }
+      }
+      priorityQueues.delete(myId);
 
       // ГАРАНТИРОВАННАЯ ДОСТАВКА: при reconnect показываем file-available ТОЛЬКО если оно ЕЩЁ НЕ в очереди events
       // (flushEventsToUser уже отправил его если оно было в очереди)
