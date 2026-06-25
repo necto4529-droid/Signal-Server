@@ -24,9 +24,12 @@ db.exec(`
     recipient_id TEXT NOT NULL,
     type         TEXT NOT NULL,
     payload      TEXT NOT NULL,
-    created_at   INTEGER NOT NULL
+    created_at   INTEGER NOT NULL,
+    retry_count  INTEGER NOT NULL DEFAULT 0,
+    last_retry   INTEGER NOT NULL DEFAULT 0
   );
   CREATE INDEX IF NOT EXISTS idx_recipient ON events (recipient_id);
+  CREATE INDEX IF NOT EXISTS idx_events_type ON events (type);
 
   CREATE TABLE IF NOT EXISTS groups (
     id          TEXT PRIMARY KEY,
@@ -71,6 +74,15 @@ try {
   // Колонка уже существует — игнорируем ошибку
 }
 
+// ГАРАНТИРОВАННАЯ ДОСТАВКА: Миграция — добавляем колонки retry_count и last_retry
+// для существующих БД без этих колонок
+try {
+  db.exec(`ALTER TABLE events ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`);
+} catch(e) { /* Колонка уже существует */ }
+try {
+  db.exec(`ALTER TABLE events ADD COLUMN last_retry INTEGER NOT NULL DEFAULT 0`);
+} catch(e) { /* Колонка уже существует */ }
+
 // ─── Подготовленные запросы ───────────────────────────────────────────────────
 const stmtInsertEvent     = db.prepare(`INSERT INTO events (recipient_id,type,payload,created_at) VALUES (?,?,?,?)`);
 const stmtGetEvents       = db.prepare(`SELECT * FROM events WHERE recipient_id=? ORDER BY created_at`);
@@ -104,6 +116,29 @@ const stmtDeleteFileAvail = db.prepare(`
   DELETE FROM events
   WHERE recipient_id=? AND type='file-available'
     AND json_extract(payload,'$.fileId')=?
+`);
+
+// ГАРАНТИРОВАННАЯ ДОСТАВКА: Дополнительные prepared statements
+// Для повторной отправки недоставленных событий (аналог Telegram)
+const stmtGetPendingEvents  = db.prepare(`
+  SELECT * FROM events
+  WHERE recipient_id=? AND last_retry < ? AND retry_count < 10
+  ORDER BY created_at ASC
+  LIMIT 50
+`);
+const stmtUpdateRetry       = db.prepare(`
+  UPDATE events SET retry_count=retry_count+1, last_retry=? WHERE id=?
+`);
+const stmtGetAllPending     = db.prepare(`
+  SELECT DISTINCT recipient_id FROM events
+  WHERE last_retry < ? AND retry_count < 10
+`);
+
+// Дедупликация: проверяем есть ли уже такой же тип события для этого получателя
+const stmtCheckDupEvent     = db.prepare(`
+  SELECT id FROM events
+  WHERE recipient_id=? AND type=? AND json_extract(payload,'$.msgId')=?
+  LIMIT 1
 `);
 
 // ─── Push ─────────────────────────────────────────────────────────────────────
@@ -451,9 +486,66 @@ function resetHeartbeat(peerId) {
   if(heartbeats.has(peerId)) clearTimeout(heartbeats.get(peerId));
   heartbeats.set(peerId, setTimeout(() => { peers.get(peerId)?.close(); }, HEARTBEAT_TIMEOUT));
 }
+// ГАРАНТИРОВАННАЯ ДОСТАВКА: Улучшенный enqueueEvent с дедупликацией
+// Для сообщений (тип incoming-msg) проверяем чтобы не дублировать одинаковые msgId
 function enqueueEvent(recipientId, type, payload) {
+  // Дедупликация для incoming-msg: если сообщение с таким msgId уже есть в очереди — не добавляем
+  if (type === 'incoming-msg' && payload.msgId) {
+    const dup = stmtCheckDupEvent.get(recipientId, type, payload.msgId);
+    if (dup) {
+      console.log(`[Dedup] Event already queued for ${recipientId}: ${type}/${payload.msgId}`);
+      return dup.id;
+    }
+  }
   return stmtInsertEvent.run(recipientId, type, JSON.stringify(payload), Date.now()).lastInsertRowid;
 }
+
+// ГАРАНТИРОВАННАЯ ДОСТАВКА: Отправка всех недоставленных событий пользователю при подключении
+// Аналог Telegram: все недоставленные сообщения приходят при первом же подключении
+function flushEventsToUser(userId, ws) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const now = Date.now();
+  // Берём все события которые ещё не были доставлены (retry_count < 10)
+  const events = stmtGetEvents.all(userId);
+  for (const ev of events) {
+    try {
+      const payload = JSON.parse(ev.payload);
+      send(ws, { type: ev.type, ...payload, eventId: ev.id });
+      stmtUpdateRetry.run(now, ev.id);
+    } catch(e) {
+      console.error('[FlushEvents] Error sending event', ev.id, e.message);
+    }
+  }
+}
+
+// ГАРАНТИРОВАННАЯ ДОСТАВКА: Периодическая повторная отправка для онлайн пользователей
+// Если пользователь онлайн, но не отправил ack-event — повторяем отправку через 30 секунд
+const RETRY_INTERVAL_MS = 30_000; // 30 секунд
+setInterval(() => {
+  const now = Date.now();
+  const cutoff = now - RETRY_INTERVAL_MS;
+  // Находим всех пользователей у которых есть недоставленные события
+  const pendingUsers = stmtGetAllPending.all(cutoff);
+  for (const { recipient_id } of pendingUsers) {
+    const userWs = peers.get(recipient_id);
+    if (userWs && userWs.readyState === WebSocket.OPEN) {
+      // Пользователь онлайн — повторяем отправку недоставленных событий
+      const events = stmtGetPendingEvents.all(recipient_id, cutoff);
+      for (const ev of events) {
+        try {
+          const payload = JSON.parse(ev.payload);
+          send(userWs, { type: ev.type, ...payload, eventId: ev.id });
+          stmtUpdateRetry.run(now, ev.id);
+        } catch(e) {
+          console.error('[Retry] Error resending event', ev.id, e.message);
+        }
+      }
+      if (events.length > 0) {
+        console.log(`[Retry] Resent ${events.length} events to online user ${recipient_id}`);
+      }
+    }
+  }
+}, RETRY_INTERVAL_MS);
 
 // ─── Группы ──────────────────────────────────────────────────────────────────
 const stmtGetGroup        = db.prepare('SELECT * FROM groups WHERE id=?');
@@ -573,23 +665,24 @@ wss.on('connection', (ws) => {
   
       flushPriorityQueue(myId);
       
-      // Delta-Sync теперь управляется отдельным типом сообщения,
-      // но при первой регистрации мы всё равно шлём последние события.
-      const rows = stmtGetEvents.all(myId);
-      const events = rows.map(r => ({
-        id: r.id,
-        type: r.type,
-        payload: JSON.parse(r.payload)
-      }));
-      for(const ev of events) send(ws, { type: ev.type, ...ev.payload, eventId: ev.id });
+      // ГАРАНТИРОВАННАЯ ДОСТАВКА: При подключении отправляем ВСЕ накопленные события
+      // Аналог Telegram — все офлайн-сообщения приходят при первом же подключении
+      // flushEventsToUser обновляет retry_count и last_retry для каждого события
+      flushEventsToUser(myId, ws);
 
-      // ИСПРАВЛЕНИЕ: при reconnect показываем file-available с thumb ТОЛЬКО если файл полностью загружен.
-      // Если файл ещё загружается — отправляем file-available БЕЗ thumb (чтобы получатель
-      // знал о файле, но миниатюра не показывалась до завершения загрузки).
+      // ГАРАНТИРОВАННАЯ ДОСТАВКА: при reconnect показываем file-available ТОЛЬКО если оно ЕЩЁ НЕ в очереди events
+      // (flushEventsToUser уже отправил его если оно было в очереди)
+      // Также отправляем файлы которые ещё загружаются (нет в events, но есть в file_headers)
+      const stmtCheckFileAvailInEvents = db.prepare(`
+        SELECT id FROM events WHERE recipient_id=? AND type='file-available' AND json_extract(payload,'$.fileId')=? LIMIT 1
+      `);
       const pendingFiles = stmtGetPendingFiles.all(myId);
       for(const h of pendingFiles) {
         const cnt = stmtCountChunks.get(h.file_id);
         if(!cnt || cnt.cnt < 1) continue;
+        // Проверяем: если file-available уже есть в events — flushEventsToUser уже его отправил, не дублируем
+        const alreadyInQueue = stmtCheckFileAvailInEvents.get(myId, h.file_id);
+        if (alreadyInQueue) continue;
         const isComplete = cnt.cnt >= h.total_chunks;
         send(ws, {
           type: 'file-available',
@@ -618,14 +711,17 @@ wss.on('connection', (ws) => {
       return;
     }
 
-    // УЛЬТИМАТИВНАЯ ОПТИМИЗАЦИЯ: Delta-Sync Handler
+    // ГАРАНТИРОВАННАЯ ДОСТАВКА: Delta-Sync Handler
+    // Отправляем все события начиная с sinceId, обновляем retry_count
     if (data.type === 'delta-sync') {
       if (!myId) return;
       const sinceId = parseInt(data.sinceId) || 0;
+      const now = Date.now();
       // Выбираем только те события, которые клиент ещё не получал
       const rows = db.prepare('SELECT * FROM events WHERE recipient_id=? AND id > ? ORDER BY id ASC').all(myId, sinceId);
       for (const r of rows) {
         send(ws, { type: r.type, ...JSON.parse(r.payload), eventId: r.id });
+        stmtUpdateRetry.run(now, r.id);
       }
       return;
     }
@@ -964,6 +1060,9 @@ wss.on('connection', (ws) => {
       if(targetWs && targetWs.readyState === WebSocket.OPEN) {
         // Текстовые сообщения отправляем мгновенно
         send(targetWs, { type: 'incoming-msg', from: myId, msgId, payload, eventId, priority: isTextOnly ? 'high' : 'normal' });
+        // ГАРАНТИРОВАННАЯ ДОСТАВКА: Обновляем retry_count даже если пользователь онлайн
+        // Событие остаётся в БД до получения ack-event от клиента
+        stmtUpdateRetry.run(Date.now(), eventId);
       } else {
         const queue = priorityQueues.get(target) || [];
         // Текстовые сообщения добавляем в начало очереди (перед файлами)
@@ -986,11 +1085,15 @@ wss.on('connection', (ws) => {
       stmtDeleteById.run(row.id);
       if(!row.sender) return;
       const deliveryPayload = { msgId: data.msgId, by: myId };
+      // ГАРАНТИРОВАННАЯ ДОСТАВКА: msg-delivered всегда сохраняется в БД
+      // Если отправитель офлайн — он получит уведомление при следующем подключении
       const deliveredEventId = enqueueEvent(row.sender, 'msg-delivered', deliveryPayload);
       const senderWs = peers.get(row.sender);
       if(senderWs && senderWs.readyState === WebSocket.OPEN) {
         send(senderWs, { type: 'msg-delivered', ...deliveryPayload, eventId: deliveredEventId });
+        stmtUpdateRetry.run(Date.now(), deliveredEventId);
       }
+      console.log(`[Delivery] msg-delivered enqueued for ${row.sender}: msgId=${data.msgId}`);
       return;
     }
 
